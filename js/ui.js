@@ -197,7 +197,7 @@ export class UI {
     const st = b.stats(mode);
     const today = toSol(st.todayLamports);
     const openPos = [...b.positions.values()];
-    const usd = b.solUsd ? '$' + (bal * b.solUsd).toFixed(2) : '';
+    const usd = b.solUsd ? '$' + (bal * b.solUsd).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '';
     const alerts = [...b.alerts.values()];
     const statusText = this.powerStatus();
     const feedLive = b.feed?.isLive();
@@ -211,7 +211,7 @@ export class UI {
       </div>
       ${this.homeBanners()}
       <div class="card balance">
-        <div class="spread"><span class="label">${real ? 'Bot wallet' : 'Practice balance'}</span>${real ? `<button class="btn small" data-action="deposit">Add SOL</button>` : ''}</div>
+        <div class="spread"><span class="label">${real ? 'Bot wallet' : 'Practice balance'}</span>${real ? `<button class="btn small" data-action="deposit">Add SOL</button>` : `<button class="btn small" data-action="practice-sheet">Add money</button>`}</div>
         <div class="amount money">${solNum(bal)} <small>SOL</small></div>
         <div class="usd">${usd}${real && b.balance === null ? 'Checking balance…' : ''}</div>
         <div class="today">
@@ -542,6 +542,7 @@ export class UI {
       <div class="section-title">Practice</div>
       <div class="list">
         <div class="item"><div class="grow">Practice balance</div><div class="val money" id="set-practice"></div></div>
+        <button class="item" data-action="practice-sheet"><div class="grow">Add practice money</div><span class="chev">›</span></button>
         <button class="item" data-action="reset-practice"><div class="grow" style="color:var(--blue)">Reset practice to ${s.practiceStartSol} SOL</div></button>
       </div>
       <div class="section-title">Connection</div>
@@ -565,7 +566,7 @@ export class UI {
     const b = this.bot;
     const set = (id, html) => { const e = document.getElementById(id); if (e && e.innerHTML !== html) e.innerHTML = html; };
     set('set-balance', b.balance === null ? '–' : solNum(toSol(b.balance)) + ' SOL');
-    set('set-practice', solNum(toSol(b.practice.balance)) + ' SOL');
+    set('set-practice', solNum(toSol(b.practice.balance)) + ' SOL' + (b.solUsd ? ` <span class="small">($${(toSol(b.practice.balance) * b.solUsd).toLocaleString('en-US', { maximumFractionDigits: 0 })})</span>` : ''));
     const key = b.settings.rpcInput || '';
     set('set-key', key ? esc(b.rpcInfo ? b.rpcInfo.label + ' · ' + (key.length > 10 ? '••••' + key.slice(-4) : '••••') : "Not valid. Tap to fix.") : 'Not set');
     set('set-rpc', !b.rpc ? 'Not set' : b.alerts.has('rpc') ? '<span class="down">Problem</span>' : b.rpc.lastOkAt ? '<span class="up">Connected</span>' : 'Ready');
@@ -651,7 +652,7 @@ export class UI {
 
   updateSheet() {
     if (!this.sheet) return;
-    if (['coin', 'pos', 'activity', 'deposit'].includes(this.sheet.kind)) this.renderSheet();
+    if (['coin', 'pos', 'activity', 'deposit', 'practice'].includes(this.sheet.kind)) this.renderSheet();
   }
 
   renderSheet() {
@@ -713,6 +714,14 @@ export class UI {
         <div class="point"><span class="n">2</span><p><strong>In Phantom tap Send → Solana</strong>Paste the address, enter an amount and send. Start small, like 0.1 to 0.3 SOL.</p></div>
         <div class="point"><span class="n">3</span><p><strong>Come back here</strong>The balance updates within a few seconds: <span class="money">${b.balance === null ? '…' : solNum(toSol(b.balance)) + ' SOL'}</span></p></div></div>
         <p class="small muted">Only send SOL on the Solana network.</p>${close}`;
+    } else if (kind === 'practice') {
+      const bal = toSol(b.practice.balance);
+      const pending = Number(b.settings.pendingPracticeUsd) || 0;
+      html = `<h2>Add practice money</h2><p class="lead">Pretend money for testing the bot on live coins. Real SOL can only come from your own wallet.</p>
+        <div class="card tight"><div class="spread"><span class="muted">Practice balance</span><b class="money">${solNum(bal)} SOL${b.solUsd ? ` · $${(bal * b.solUsd).toLocaleString('en-US', { maximumFractionDigits: 0 })}` : ''}</b></div></div>
+        ${pending ? `<div class="alert warn"><span class="ico">⏳</span><div class="grow">Adding $${pending} as soon as the SOL price loads.</div></div>` : ''}
+        <div class="btn-row mt" style="grid-template-columns:repeat(2,1fr)">${[100, 500, 1000, 5000].map((u) => `<button class="btn go" data-action="practice-add" data-usd="${u}" ${b.solUsd ? '' : 'disabled'}>+$${u.toLocaleString('en-US')}</button>`).join('')}</div>
+        <p class="small muted center">${b.solUsd ? `At today's SOL price ($${b.solUsd.toFixed(2)}).` : 'Waiting for the SOL price…'}</p>${close}`;
     } else if (kind === 'withdraw') {
       const openReal = [...b.positions.values()].filter((p) => p.mode === 'real').length;
       html = `<h2>Send SOL to Phantom</h2><p class="lead">Move SOL from the bot wallet to your own wallet. Balance: <span class="money">${b.balance === null ? '…' : solNum(toSol(b.balance)) + ' SOL'}</span></p>
@@ -840,6 +849,14 @@ export class UI {
         case 'activity': this.openSheet('activity'); break;
         case 'help': this.openSheet('help'); break;
         case 'deposit': this.openSheet('deposit'); break;
+        case 'practice-sheet': if (!b.solUsd) b.refreshSolPrice(); this.openSheet('practice'); break;
+        case 'practice-add': {
+          const usd = Number(t.dataset.usd);
+          const lam = b.addPracticeUsd(usd);
+          this.toast(`Added $${usd.toLocaleString('en-US')} (${solNum(toSol(lam))} SOL) to practice.`);
+          this.renderSheet();
+          break;
+        }
         case 'withdraw': b.refreshBalance().catch(() => {}); this.openSheet('withdraw'); break;
         case 'backup': {
           const ok = await this.confirm({ title: 'Show your backup key?', text: 'Make sure nobody can see your screen. Anyone with this key can take the bot wallet’s SOL.', ok: 'Continue' });

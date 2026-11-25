@@ -17,6 +17,9 @@ const addr = () => b58encode(nodeCrypto.randomBytes(32));
 test('settings: old saves are migrated; overrides are clamped; junk is ignored', () => {
   assert.equal(migrateSettings({ skipMayhem: true }).skipMayhem, false, 'v2 allows mayhem coins (with strict checks)');
   assert.equal(migrateSettings({ settingsVersion: 2, skipMayhem: true }).skipMayhem, true, 'a v2 choice is kept');
+  assert.equal(migrateSettings({ settingsVersion: 2, setupDone: true }).pendingPracticeUsd, 500, 'v3: a one-time $500 practice top-up');
+  assert.equal(migrateSettings({ settingsVersion: 3, setupDone: true, pendingPracticeUsd: 0 }).pendingPracticeUsd, 0, 'only once');
+  assert.equal(migrateSettings({}).pendingPracticeUsd, undefined, 'not for a brand-new setup');
   const r = resolveRules({ ...DEFAULT_SETTINGS, tradeSol: 1000, stopLossPct: 200, maxOpen: 2.6, takeProfitPct: 'abc', trailDropPct: -5, studySec: 2, mayhemProfitMinUsd: 8, mayhemProfitMaxUsd: 3 });
   assert.equal(r.tradeSol, 100);
   assert.equal(r.stopLossPct, 95);

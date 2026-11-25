@@ -176,3 +176,34 @@ test('copy trading: never copies while the bot is stopped, but the tracker still
   await sleep(5);
   assert.equal(TestWS.watching(leader), false, 'stopped watching');
 });
+
+// ---------- practice money ----------
+
+test('practice money: the one-time $500 is added once the SOL price loads, and only once', async () => {
+  const { MockChain } = await import('./mockchain.mjs');
+  const { MemStorage } = await import('./harness.mjs');
+  const chain = new MockChain();
+  const fetchImpl = async (url, init) => (String(url).includes('coingecko') ? { ok: true, status: 200, json: async () => ({ solana: { usd: 125 } }) } : chain.fetchImpl(url, init));
+  const storage = new MemStorage();
+  const store = new Store(storage);
+  store.save('settings', { settingsVersion: 2, setupDone: true, mode: 'practice', rpcInput: 'https://rpc.test/' });
+  store.save('state', { practice: { balance: 250_000_000n } });
+  const bot = new Bot({ store, fetchImpl, WebSocketImpl: TestWS, timing: FAST });
+  bots.push(bot);
+  await bot.init();
+  await until(() => bot.practice.balance > 250_000_000n);
+  assert.equal(bot.practice.balance, 250_000_000n + 4_000_000_000n, '$500 at $125 = 4 SOL');
+  assert.equal(bot.settings.pendingPracticeUsd, 0);
+  assert.match(bot.activity[0].message, /Added \$500 \(4\.000 SOL\)/);
+  bot.dispose();
+  const again = new Bot({ store: new Store(storage), fetchImpl, WebSocketImpl: TestWS, timing: FAST });
+  bots.push(again);
+  await again.init();
+  await sleep(30);
+  assert.equal(again.practice.balance, 4_250_000_000n, 'not added twice');
+  // and the Add buttons work any time
+  again.addPracticeUsd(100);
+  assert.equal(again.practice.balance, 4_250_000_000n + 800_000_000n);
+  again.solUsd = null;
+  assert.throws(() => again.addPracticeUsd(100), /SOL price/);
+});

@@ -290,13 +290,44 @@ export class Bot extends EventTarget {
   }
 
   async refreshSolPrice() {
-    try {
-      const f = this.fetchImpl || ((...a) => globalThis.fetch(...a));
-      const r = await f('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
-      const j = await r.json();
-      const v = Number(j?.solana?.usd);
-      if (v > 0 && v < 100000) { this.solUsd = v; this._emit(); }
-    } catch { /* show SOL only */ }
+    const f = this.fetchImpl || ((...a) => globalThis.fetch(...a));
+    const sources = [
+      ['https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', (j) => j?.solana?.usd],
+      ['https://api.coinbase.com/v2/prices/SOL-USD/spot', (j) => j?.data?.amount],
+    ];
+    for (const [url, pick] of sources) {
+      try {
+        const r = await f(url);
+        const v = Number(pick(await r.json()));
+        if (v > 0 && v < 100000) {
+          this.solUsd = v;
+          this._applyPendingPractice();
+          this._emit();
+          return v;
+        }
+      } catch { /* try the next source; without a price the app shows SOL only */ }
+    }
+    return null;
+  }
+
+  /** Add pretend money to the practice balance, in dollars at the live SOL price. */
+  addPracticeUsd(usd) {
+    const n = Number(usd);
+    if (!(n > 0) || n > 1_000_000) throw new Error('Pick an amount to add.');
+    if (!(this.solUsd > 0)) throw new Error("Couldn't get the SOL price yet. Try again in a moment.");
+    const lamports = pump.solToLamports(n / this.solUsd);
+    this.practice.balance = BigInt(this.practice.balance) + lamports;
+    this.log('info', `Added $${n.toLocaleString('en-US')} (${pump.lamportsToSol(lamports).toFixed(3)} SOL) to your practice balance.`);
+    this._save();
+    this._emit();
+    return lamports;
+  }
+
+  _applyPendingPractice() {
+    const usd = Number(this.settings.pendingPracticeUsd) || 0;
+    if (!(usd > 0) || !(this.solUsd > 0)) return;
+    this.settings.pendingPracticeUsd = 0;
+    this.addPracticeUsd(usd);
   }
 
   availableLamports(mode = this.settings.mode) {

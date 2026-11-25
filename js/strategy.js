@@ -50,7 +50,7 @@ export const SPEEDS = {
   turbo: { label: 'Turbo', microLamports: 3_000_000, maxMicroLamports: 6_000_000 },
 };
 
-export const SETTINGS_VERSION = 2;
+export const SETTINGS_VERSION = 3;
 
 // Settings the user can change; anything left null uses the style's value.
 export const DEFAULT_SETTINGS = {
@@ -69,6 +69,7 @@ export const DEFAULT_SETTINGS = {
   mayhemProfitMaxUsd: 10,
   keepSolReserve: 0.01,
   practiceStartSol: 1,
+  pendingPracticeUsd: 0, // practice money to add once the SOL price is known
 };
 
 const NUMERIC_LIMITS = {
@@ -79,10 +80,10 @@ const NUMERIC_LIMITS = {
 /** Bring settings saved by an older version up to date. */
 export function migrateSettings(s) {
   const out = { ...s };
-  if (!(out.settingsVersion >= 2)) {
-    out.skipMayhem = false; // v2: mayhem coins allowed, but only when the study says they're flying
-    out.settingsVersion = 2;
-  }
+  const v = Number(out.settingsVersion) || 1;
+  if (v < 2) out.skipMayhem = false; // v2: mayhem coins allowed, but only when the study says they're flying
+  if (v < 3 && out.setupDone) out.pendingPracticeUsd = (Number(out.pendingPracticeUsd) || 0) + 500; // v3: a one-time $500 practice top-up
+  out.settingsVersion = SETTINGS_VERSION;
   return out;
 }
 
