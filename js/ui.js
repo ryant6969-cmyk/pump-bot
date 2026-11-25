@@ -13,6 +13,7 @@ const ICONS = {
   home: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6h-6v6H4a1 1 0 0 1-1-1z"/></svg>',
   coins: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/></svg>',
   trades: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M7 9h10M7 13h6M7 17h4"/></svg>',
+  wallets: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 7V5.5A1.5 1.5 0 0 0 17.5 4H5a2 2 0 0 0 0 4h15a1 1 0 0 1 1 1v3"/><path d="M3 6v12a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-3"/><path d="M21 12h-4a2 2 0 0 0 0 4h4z"/></svg>',
   settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>',
   share: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px"><path d="M12 3v12M7 8l5-5 5 5"/><path d="M5 12v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7"/></svg>',
 };
@@ -69,9 +70,32 @@ function short(a) { return a ? a.slice(0, 4) + '…' + a.slice(-4) : ''; }
 function hue(s) { let h = 0; for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) >>> 0; return h % 360; }
 function avatar(symbol, mint) {
   const letters = String(symbol || '?').replace(/[^\p{L}\p{N}]/gu, '').slice(0, 2).toUpperCase() || '?';
-  return `<span class="avatar" style="background:hsl(${hue(mint)} 70% 62%)">${esc(letters)}</span>`;
+  const h = hue(mint);
+  return `<span class="avatar" style="background:linear-gradient(135deg,hsl(${h} 42% 62%),hsl(${(h + 40) % 360} 38% 46%))">${esc(letters)}</span>`;
 }
 function cls(sol) { return sol > 0 ? 'up' : sol < 0 ? 'down' : ''; }
+function clamp01(x) { return Math.max(0, Math.min(1, Number.isFinite(x) ? x : 0)); }
+
+/** A gold ring showing a 0-100 score. */
+export function scoreRing(score, kind = '', big = false) {
+  const has = score !== null && score !== undefined;
+  const v = has ? Math.max(0, Math.min(100, Math.round(score))) : 0;
+  const r = 15.5, C = 2 * Math.PI * r;
+  return `<span class="score ${kind} ${big ? 'big' : ''}"><svg viewBox="0 0 36 36" aria-hidden="true"><circle class="trk" cx="18" cy="18" r="${r}"></circle><circle class="val" cx="18" cy="18" r="${r}" stroke-dasharray="${((C * v) / 100).toFixed(1)} ${C.toFixed(1)}"></circle></svg><b>${has ? v : '–'}</b></span>`;
+}
+
+/** A tiny market-cap line. */
+export function sparkline(snaps, w = 64, h = 22) {
+  const vals = (snaps || []).slice(-40).map((x) => x.mcap).filter((v) => v > 0);
+  if (vals.length < 2) return `<svg class="spark flat" viewBox="0 0 ${w} ${h}" aria-hidden="true"></svg>`;
+  const min = Math.min(...vals), max = Math.max(...vals);
+  const span = max - min || max * 0.01 || 1;
+  const step = w / (vals.length - 1);
+  const pts = vals.map((v, i) => `${(i * step).toFixed(1)},${(h - 2 - ((v - min) / span) * (h - 4)).toFixed(1)}`).join(' ');
+  const a = vals[0], z = vals[vals.length - 1];
+  const dir = z > a * 1.01 ? 'up' : z < a * 0.99 ? 'down' : 'flat';
+  return `<svg class="spark ${dir}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true"><polyline points="${pts}"></polyline></svg>`;
+}
 
 function isIos() { return /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1); }
 function isStandalone() { return window.navigator.standalone === true || window.matchMedia?.('(display-mode: standalone)').matches; }
@@ -96,7 +120,8 @@ export class UI {
     this.store = store;
     this.version = version;
     this.tab = 'home';
-    this.coinView = 'hot';
+    this.coinView = 'study';
+    this.tracking = false;
     this.tradesView = 'open';
     this.wiz = { step: 0, key: '', keyTest: null, importing: false, style: 'balanced', backupChecked: false, showKey: false, busy: false };
     this.sheet = null;
@@ -140,6 +165,7 @@ export class UI {
     if (tb) { const tmp = document.createElement('div'); tmp.innerHTML = this.tabbar(); patch(tb, tmp.firstElementChild.innerHTML); }
     if (this.tab === 'home') this.renderHome();
     else if (this.tab === 'coins') this.updateCoins();
+    else if (this.tab === 'wallets') this.renderWallets();
     else if (this.tab === 'trades') this.renderTrades();
     else if (this.tab === 'settings') this.updateSettingsLive();
     this.updateSheet();
@@ -148,12 +174,13 @@ export class UI {
   tabbar() {
     const open = this.bot.positions.size;
     const t = (id, label) => `<button data-action="tab" data-tab="${id}" class="${this.tab === id ? 'on' : ''}" aria-label="${label}">${ICONS[id]}<span>${label}</span>${id === 'trades' && open ? `<span class="count">${open}</span>` : ''}</button>`;
-    return `<nav class="tabbar">${t('home', 'Home')}${t('coins', 'Coins')}${t('trades', 'Trades')}${t('settings', 'Settings')}</nav>`;
+    return `<nav class="tabbar">${t('home', 'Home')}${t('coins', 'Coins')}${t('wallets', 'Wallets')}${t('trades', 'Trades')}${t('settings', 'Settings')}</nav>`;
   }
 
   renderTab() {
     if (this.tab === 'home') this.renderHome();
     else if (this.tab === 'coins') this.renderCoinsShell();
+    else if (this.tab === 'wallets') this.renderWallets();
     else if (this.tab === 'trades') this.renderTrades();
     else this.renderSettings();
   }
@@ -179,7 +206,7 @@ export class UI {
     const needAwake = b.running || openPos.length > 0;
     patch(el, `
       <div class="bar">
-        <h1 class="title" style="margin:4px 0 0">Win Bot</h1>
+        <div class="brand">Win Bot<small>pump.fun trading desk</small></div>
         <button class="pill mode" data-action="mode-sheet">${real ? 'REAL' : 'PRACTICE'}</button>
       </div>
       ${this.homeBanners()}
@@ -200,9 +227,10 @@ export class UI {
         <div class="power-status">${statusText}</div>
         ${b.pausedReason ? `<button class="btn small go" data-action="resume">Resume buying</button>` : ''}
       </div>
+      ${this.brainCard()}
       <div class="lights">
         <div class="light">Coin feed<div class="row"><span class="dot ${!b.running ? '' : feedLive ? 'ok' : 'warn'}"></span>${!b.running ? 'Off' : feedLive ? 'Live' : 'Connecting'}</div></div>
-        <div class="light">Prices<div class="row"><span class="dot ${b.alerts.has('rpc') ? 'bad' : pricesOk ? 'ok' : ''}"></span>${b.alerts.has('rpc') ? 'Problem' : pricesOk ? 'Live' : 'Idle'}</div></div>
+        <div class="light">Live trades<div class="row"><span class="dot ${b.alerts.has('rpc') ? 'bad' : b.streamStatus === 'live' ? 'ok' : pricesOk ? 'warn' : ''}"></span>${b.alerts.has('rpc') ? 'Problem' : b.streamStatus === 'live' ? 'Live' : pricesOk ? 'Prices only' : 'Idle'}</div></div>
         <button class="light" data-action="keep-awake" style="text-align:left">Screen<div class="row"><span class="dot ${!needAwake ? '' : awake ? 'ok' : 'warn'}"></span>${!needAwake ? 'Normal' : awake ? 'Stays on' : 'Tap: keep on'}</div></button>
       </div>
       ${alerts.map((a) => `<div class="alert ${esc(a.level)}"><span class="ico">${a.level === 'error' ? '⚠️' : a.level === 'warn' ? '⏸' : 'ℹ️'}</span><div class="grow">${esc(a.message)}</div></div>`).join('')}
@@ -236,12 +264,40 @@ export class UI {
       return b.settings.mode === 'real' ? 'Tap Start to trade with real SOL.' : 'Tap Start to practice with pretend SOL on live coins.';
     }
     if (b.pausedReason) return esc(b.pausedReason);
-    if (!b.settings.autoBuy) return 'Manual mode: pick coins on the Coins tab. The bot sells them for you.';
-    if (b.buyInFlight) return '<strong>Checking a coin…</strong>';
+    if (b.buyInFlight) return '<strong>A coin passed. Checking holders, then buying…</strong>';
     if (b.entryBlock) return esc(b.entryBlock);
+    const br = b.brain();
+    if (!b.settings.autoBuy) return 'Auto-buy is off: the bot scores coins, you pick on the Coins tab. It still sells for you.';
+    if (br.passed.length) return `<strong>${esc(br.passed[0].symbol)}</strong> passed the study. Buying…`;
+    if (br.studying.length) return `Studying <strong>${br.studying.length}</strong> coin${br.studying.length === 1 ? '' : 's'}: reading every trade before it buys.`;
     const watching = [...b.coins.values()].filter((c) => c.watching).length;
     if (!b.feed?.isLive() && !watching) return 'Connecting to the live coin feed…';
-    return `Watching <strong>${watching}</strong> new coin${watching === 1 ? '' : 's'} for a strong move.`;
+    return `Scanning <strong>${watching}</strong> new coin${watching === 1 ? '' : 's'} for real buying.`;
+  }
+
+  brainCard() {
+    const b = this.bot;
+    if (!b.running) return '';
+    const br = b.brain();
+    const p = br.pipeline;
+    const rows = [...br.passed, ...br.studying].slice(0, 4).map((c) => this.studyRow(c)).join('');
+    return `<div class="card brain mt">
+      <div class="spread"><h3>The bot's study desk</h3>${br.pickiness ? `<span class="badge gold">PICKIER +${br.pickiness}</span>` : '<span class="badge">LIVE</span>'}</div>
+      <div class="funnel"><div><b>${p.scanned}</b><span>Scanned</span></div><div class="hi"><b>${br.studying.length}</b><span>Studying</span></div><div><b>${p.passed}</b><span>Passed</span></div><div><b>${p.bought}</b><span>Bought</span></div></div>
+      ${rows || `<p class="small muted" style="margin:8px 2px 6px">Watching new coins for real buyers and money coming in. Most coins never qualify for a study.</p>`}
+      ${br.pickiness ? `<p class="small muted" style="margin:6px 2px 2px">${br.lossStreak} loss${br.lossStreak === 1 ? '' : 'es'} in a row, so coins need ${br.pickiness} more points until the next win.</p>` : ''}
+    </div>`;
+  }
+
+  studyRow(c) {
+    const now = Date.now();
+    const v = c.verdict;
+    const total = Math.max(1, (c.studyEnd || now) - (c.studyStart || now));
+    const left = Math.max(0, Math.ceil(((c.studyEnd || now) - now) / 1000));
+    const why = c.stage === 'passed' ? `Passed with ${v?.score ?? '–'}. Buying…` : v ? (v.ok ? `Looking strong · ${left}s left` : `${v.vetoes[0] || v.reason} · ${left}s left`) : `Reading trades · ${left}s left`;
+    return `<button class="study-row" data-action="coin" data-mint="${esc(c.mint)}">${scoreRing(v ? v.score : null, v ? (v.ok ? 'pass' : '') : 'fail')}
+      <div><div class="nm">${esc(c.symbol)} ${c.isMayhemMode ? '<span class="badge mayhem">MAYHEM</span>' : ''}</div><div class="why">${esc(why)}</div>${c.stage === 'study' ? `<div class="timer"><i style="width:${(clamp01((now - c.studyStart) / total) * 100).toFixed(0)}%"></i></div>` : ''}</div>
+      <div class="right small">${this.mcapText(c.lastMcap)}</div></button>`;
   }
 
   posRow(p) {
@@ -251,7 +307,7 @@ export class UI {
     const pp = value !== null && cost > 0 ? (pnl / cost) * 100 : null;
     const state = p.state === 'selling' ? 'Selling…' : p.found ? 'In wallet' : p.lastError && p.sellAttempts ? 'Retrying sale' : 'Held ' + ago(p.openedAt);
     return `<button class="item" data-action="pos" data-id="${esc(p.id)}">${avatar(p.symbol, p.mint)}
-      <div class="grow"><div style="font-weight:650">${esc(p.symbol)} <span class="badge ${p.mode}">${p.mode === 'real' ? 'REAL' : 'PRACTICE'}</span></div><div class="small muted">${esc(state)}</div></div>
+      <div class="grow"><div style="font-weight:650">${esc(p.symbol)} <span class="badge ${p.mode}">${p.mode === 'real' ? 'REAL' : 'PRACTICE'}</span>${p.copiedFrom ? ' <span class="badge copy">COPY</span>' : ''}${p.mayhem ? ' <span class="badge mayhem">MAYHEM</span>' : ''}</div><div class="small muted">${esc(state)}</div></div>
       <div class="val"><div class="${cls(pnl ?? 0)}" style="font-weight:700;font-size:17px">${pp !== null ? pct(pp) : '…'}</div><div class="small">${value !== null ? solNum(value) + ' SOL' : ''}</div></div></button>`;
   }
 
@@ -274,7 +330,10 @@ export class UI {
           <button class="btn small mode" data-action="open-pasted" style="width:100%;margin-top:4px">Open coin</button>
         </div>
       </div>
-      <div class="row mt" style="margin-bottom:10px"><div class="seg" style="flex:1"><button data-action="coin-view" data-view="hot" class="${this.coinView === 'hot' ? 'on' : ''}">Moving</button><button data-action="coin-view" data-view="new" class="${this.coinView === 'new' ? 'on' : ''}">Newest</button></div></div>
+      <div class="row mt" style="margin-bottom:10px"><div class="seg" style="flex:1">
+        <button data-action="coin-view" data-view="study" class="${this.coinView === 'study' ? 'on' : ''}">Studied</button>
+        <button data-action="coin-view" data-view="hot" class="${this.coinView === 'hot' ? 'on' : ''}">Moving</button>
+        <button data-action="coin-view" data-view="new" class="${this.coinView === 'new' ? 'on' : ''}">Newest</button></div></div>
       <div id="coin-head" class="small muted" style="margin:0 4px 8px"></div>
       <div id="coin-list"></div>`;
     this.updateCoins();
@@ -292,13 +351,17 @@ export class UI {
       let ref = s[0]; for (const x of s) { if (x.t <= last.t - 60000) ref = x; else break; }
       return ref.mcap > 0 ? (last.mcap / ref.mcap - 1) * 100 : 0;
     };
-    if (this.coinView === 'hot') coins = coins.filter((c) => c.snaps.length >= 2 && c.watching).sort((a, c) => rise(c) - rise(a));
+    const order = { passed: 0, study: 1, bought: 2, rejected: 3 };
+    if (this.coinView === 'study') coins = coins.filter((c) => c.verdict || c.stage === 'study' || c.stage === 'passed').sort((a, c) => (order[a.stage] ?? 4) - (order[c.stage] ?? 4) || (c.verdict?.at || c.studyStart || 0) - (a.verdict?.at || a.studyStart || 0));
+    else if (this.coinView === 'hot') coins = coins.filter((c) => c.snaps.length >= 2 && c.watching).sort((a, c) => rise(c) - rise(a));
     else coins.sort((a, c) => c.createdAt - a.createdAt);
     coins = coins.slice(0, 60);
     const head = document.getElementById('coin-head');
-    if (head) head.textContent = b.running ? `${b.coins.size} coins seen · ${b.feed?.isLive() ? 'live' : 'connecting…'}` : 'Start the bot on Home to see coins launching live.';
+    const br = b.brain();
+    if (head) head.textContent = b.running ? `${br.pipeline.scanned} scanned · ${br.studying.length} studying · ${br.pipeline.passed} passed · ${b.feed?.isLive() ? 'live' : 'connecting…'}` : 'Start the bot on Home to see coins launching live.';
     if (!coins.length) {
-      patch(list, `<div class="list"><div class="empty"><b>${b.running ? 'Waiting for coins…' : 'The coin feed is off'}</b>${b.running ? 'New pump.fun coins appear here within seconds.' : 'Tap Start on the Home tab. You can still paste a coin address above.'}</div></div>`);
+      const study = this.coinView === 'study';
+      patch(list, `<div class="list"><div class="empty"><b>${!b.running ? 'The coin feed is off' : study ? 'Nothing studied yet' : 'Waiting for coins…'}</b>${!b.running ? 'Tap Start on the Home tab. You can still paste a coin address above.' : study ? 'When a new coin gets real buyers, the bot studies its trades for 45 seconds and scores it. Those coins show up here.' : 'New pump.fun coins appear here within seconds.'}</div></div>`);
       return;
     }
     patch(list, `<div class="list">${coins.map((c) => this.coinRow(c, rise(c), now)).join('')}</div>`);
@@ -307,12 +370,16 @@ export class UI {
   coinRow(c, r, now) {
     const held = this.bot.positions.has(this.bot.settings.mode + ':' + c.mint);
     const prog = Math.round((c.lastProgress || 0) * 100);
-    const status = held ? 'You hold this coin' : c.status || (c.eval ? (c.eval.ok ? 'Passed the price rules' : c.eval.reason) : c.snaps.length ? '' : 'Loading price…');
-    return `<button class="coin" data-action="coin" data-mint="${esc(c.mint)}">${avatar(c.symbol, c.mint)}
+    const v = c.verdict;
+    const stage = held ? ['bought', 'Holding'] : c.stage === 'study' ? ['study', 'Studying'] : c.stage === 'passed' ? ['pass', 'Passed'] : c.stage === 'bought' ? ['bought', 'Bought'] : c.stage === 'rejected' ? ['reject', 'Rejected'] : null;
+    let status = held ? 'You hold this coin' : c.status || (c.scan && !c.scan.ok ? c.scan.reason : '') || (c.snaps.length ? '' : 'Loading price…');
+    if (c.stage === 'study' && v) status = v.ok ? `Looking strong: score ${v.score}, needs ${v.need}` : v.vetoes[0];
+    const tone = held || c.stage === 'passed' || c.stage === 'bought' ? 'good' : c.stage === 'study' ? 'gold' : '';
+    return `<button class="coin" data-action="coin" data-mint="${esc(c.mint)}">${v ? scoreRing(v.score, v.ok ? 'pass' : c.stage === 'study' ? '' : 'fail') : avatar(c.symbol, c.mint)}
       <div class="name">${esc(c.name)}<small>${esc(c.symbol)}</small></div>
-      <div class="right">${this.mcapText(c.lastMcap)}<div class="change ${cls(r)}">${c.snaps.length >= 2 ? pct(r) + ' 1m' : ''}</div></div>
-      <div class="meta"><span>${ago(c.createdAt, now)}</span><span class="rail"><i style="width:${prog}%"></i></span><span>${prog}%</span></div>
-      ${status ? `<div class="status ${held || c.status === 'Bought' ? 'good' : ''}">${esc(status)}</div>` : ''}</button>`;
+      <div class="side">${sparkline(c.snaps)}<div class="right">${this.mcapText(c.lastMcap)}</div></div>
+      <div class="meta">${stage ? `<span class="stage ${stage[0]}">${stage[1]}</span>` : ''}${c.isMayhemMode ? '<span class="badge mayhem">MAYHEM</span>' : ''}<span>${ago(c.createdAt, now)}</span><span class="rail"><i style="width:${prog}%"></i></span><span class="change ${cls(r)}">${c.snaps.length >= 2 ? pct(r) : ''}</span></div>
+      ${status ? `<div class="status ${tone}">${esc(status)}</div>` : ''}</button>`;
   }
 
   mcapText(sol) {
@@ -322,6 +389,45 @@ export class UI {
       return '$' + (usd >= 1e6 ? (usd / 1e6).toFixed(2) + 'M' : usd >= 1e3 ? (usd / 1e3).toFixed(1) + 'K' : usd.toFixed(0));
     }
     return sol.toFixed(1) + ' SOL';
+  }
+
+  // ---------- Wallets ----------
+
+  renderWallets() {
+    const el = document.getElementById('tab');
+    if (!el) return;
+    const b = this.bot;
+    const list = b.wallets;
+    patch(el, `<h1 class="title">Wallets</h1>
+      <div class="card tight">
+        <div class="field"><label for="track-input">Track a trader: paste their wallet address, pump.fun profile link, or @username</label>
+          <div class="row"><input id="track-input" class="input" placeholder="Address or @username" autocapitalize="off" autocorrect="off" spellcheck="false">
+          <button class="btn small" data-action="paste" data-target="track-input">Paste</button></div>
+          <button class="btn go" data-action="track" style="margin-top:6px;min-height:46px" ${this.tracking ? 'disabled' : ''}>${this.tracking ? 'Looking them up…' : 'Track wallet'}</button>
+        </div>
+      </div>
+      ${list.length ? list.map((w) => this.walletCard(w)).join('') : `<div class="list mt"><div class="empty"><b>No wallets yet</b>Add a trader you like. You'll see their pump.fun buys and sells live, and you can copy them.</div></div>`}
+      <p class="small muted center mt2">Copy trading buys the same pump.fun coin when they buy (with your amount) and sells when they sell, the same share they sold. Your stop loss still protects you. Copies only run while the bot is started.</p>`);
+  }
+
+  walletCard(w) {
+    const b = this.bot;
+    const name = b.walletLabel(w.address);
+    const trades = w.trades.slice(0, 6);
+    const now = Date.now();
+    const open = [...b.positions.values()].filter((p) => p.copiedFrom === w.address).length;
+    return `<div class="card wallet">
+      <div class="head">${avatar(name.replace(/^@/, ''), w.address)}<div class="grow" style="flex:1"><div class="who">${esc(name)}</div><div class="addr">${w.username || w.label ? esc(short(w.address)) + ' · ' : ''}${w.balance !== null && w.balance !== undefined ? solNum(toSol(w.balance)) + ' SOL' : 'Loading…'}</div></div>
+        <button class="btn small" data-action="wallet-refresh" data-address="${esc(w.address)}" ${w.loading ? 'disabled' : ''}>${w.loading ? '…' : 'Refresh'}</button></div>
+      <div class="copybox ${w.copy ? 'on' : ''}">
+        <label class="row" style="gap:12px"><div class="grow" style="flex:1"><div style="font-weight:650">Copy their trades</div><div class="small muted">${w.copy ? `Buys ${w.copySol} SOL of each coin they buy${open ? ` · ${open} open` : ''}` : 'Off: just watching'}</div></div>
+          <span class="switch"><input type="checkbox" data-wallet-copy="${esc(w.address)}" ${w.copy ? 'checked' : ''}><span></span></span></label>
+        ${w.copy ? `<div class="row"><span class="small" style="flex:1">SOL per copied trade</span><div class="stepper"><input data-wallet-sol="${esc(w.address)}" inputmode="decimal" value="${esc(w.copySol)}" aria-label="SOL per copied trade"><span class="small muted">SOL</span></div></div>` : ''}
+      </div>
+      <div class="wtrades">${trades.length ? trades.map((t) => `<button class="wtrade" style="background:none;border:0;text-align:left;width:100%" data-action="coin" data-mint="${esc(t.mint)}"><span class="side ${t.buy ? 'b' : 's'}">${t.buy ? 'BUY' : 'SELL'}</span><div><div>${esc(t.symbol || short(t.mint))} · ${solNum(t.sol)} SOL</div>${t.note ? `<div class="note ${/^Copied|^Copying/.test(t.note) ? 'gold' : ''}">${esc(t.note)}</div>` : ''}</div><time>${ago(t.t, now)}</time></button>`).join('')
+        : `<p class="small muted" style="margin:6px 2px">${w.loading ? 'Loading their recent trades…' : 'No pump.fun trades seen yet. New ones show up here live.'}</p>`}</div>
+      <div class="row mt"><a class="btn small" style="flex:1" href="https://pump.fun/profile/${esc(w.address)}" target="_blank" rel="noopener">pump.fun profile</a><button class="btn small danger" style="flex:1" data-action="wallet-remove" data-address="${esc(w.address)}">Remove</button></div>
+    </div>`;
   }
 
   // ---------- Trades ----------
@@ -360,9 +466,11 @@ export class UI {
     else if (p.found) state = "Found in the bot wallet. The bot won't sell it unless you tap Sell.";
     else if (p.lastError && p.sellAttempts) state = `Retrying the sale: ${esc(p.lastError)}`;
     else if (!p.managed) state = 'Not managed by the bot';
-    else state = `Sells at ${pct(rules.takeProfitPct)} or ${pct(-rules.stopLossPct)}, or after ${rules.maxHoldMin} min.`;
+    else if (p.copiedFrom) state = `Copying ${esc(this.bot.walletLabel(p.copiedFrom))}: sells when they sell. Stop loss ${pct(-rules.stopLossPct)}.`;
+    else if (p.mayhem && this.bot.solUsd) state = `Mayhem coin: takes $${rules.mayhemProfitMinUsd}–$${rules.mayhemProfitMaxUsd} profit (more while it's flying), stop loss ${pct(-rules.stopLossPct)}.`;
+    else state = `Sells at ${pct(rules.takeProfitPct)} or ${pct(-rules.stopLossPct)}, when sellers take over, or after ${rules.maxHoldMin} min.`;
     return `<div class="card pos">
-      <div class="top">${avatar(p.symbol, p.mint)}<div class="grow" style="flex:1"><div style="font-weight:700">${esc(p.name)}</div><div class="small muted">${esc(p.symbol)} · <span class="badge ${p.mode}">${p.mode === 'real' ? 'REAL' : 'PRACTICE'}</span></div></div>
+      <div class="top">${avatar(p.symbol, p.mint)}<div class="grow" style="flex:1"><div style="font-weight:700">${esc(p.name)}</div><div class="small muted">${esc(p.symbol)} · <span class="badge ${p.mode}">${p.mode === 'real' ? 'REAL' : 'PRACTICE'}</span>${p.copiedFrom ? ' <span class="badge copy">COPY</span>' : ''}${p.mayhem ? ' <span class="badge mayhem">MAYHEM</span>' : ''}${p.score !== null && p.score !== undefined ? ` <span class="badge gold">SCORE ${esc(p.score)}</span>` : ''}</div></div>
       <div class="pnl ${cls(pnl ?? 0)}">${pp !== null ? pct(pp) : '…'}<small>${pnl !== null ? signed(pnl) + ' SOL' : 'pricing…'}</small></div></div>
       <div class="facts"><div class="fact"><b>${solNum(cost)}</b><span>Paid (SOL)</span></div><div class="fact"><b>${value !== null ? solNum(value) : '–'}</b><span>Worth now</span></div><div class="fact"><b>${p.complete ? 'Graduated' : Math.round((p.progress || 0) * 100) + '%'}</b><span>Curve</span></div></div>
       <div class="state">${state}</div>
@@ -375,7 +483,7 @@ export class UI {
     const cost = toSol(h.costLamports);
     const pp = pnl !== null && cost > 0 ? (pnl / cost) * 100 : null;
     return `<button class="item" data-action="hist" data-id="${esc(h.id)}">${avatar(h.symbol, h.mint)}
-      <div class="grow"><div style="font-weight:650">${esc(h.symbol)}</div><div class="small muted">${esc(h.reason)} · ${agoText(h.closedAt)}</div></div>
+      <div class="grow"><div style="font-weight:650">${esc(h.symbol)}${h.partial ? ' <span class="badge">PART</span>' : ''}${h.copiedFrom ? ' <span class="badge copy">COPY</span>' : ''}</div><div class="small muted">${esc(h.reason)} · ${agoText(h.closedAt)}</div></div>
       <div class="val"><div class="${cls(pnl ?? 0)}" style="font-weight:700">${pp !== null ? pct(pp) : '?'}</div><div class="small">${pnl !== null ? signed(pnl) + ' SOL' : 'unknown'}</div></div></button>`;
   }
 
@@ -412,8 +520,15 @@ export class UI {
         ${num('maxHoldMin', 'Sell after', 'min', 1)}
         ${num('dailyLossSol', 'Stop buying after losing', 'SOL', 0.05)}
         ${sw('sellBeforeGraduation', 'Sell before a coin graduates', 'Sells at 95% of the curve')}
-        ${sw('skipMayhem', 'Skip "mayhem mode" coins', 'Coins with pump.fun’s trading agent')}
         <button class="item" data-action="reset-rules"><div class="grow" style="color:var(--blue)">Use the style's defaults</div></button>
+      </div>
+      <div class="section-title">How it studies coins</div>
+      <div class="list">
+        ${num('studySec', 'Study each coin for', 'sec', 5)}
+        <label class="item"><div class="grow">Trade mayhem coins<div class="small muted">Only when the study says it's flying up</div></div><span class="switch"><input type="checkbox" data-setting-inverse="skipMayhem" ${s.skipMayhem === true ? '' : 'checked'}><span></span></span></label>
+        ${num('mayhemStudySec', 'Study mayhem coins for', 'sec', 5)}
+        ${num('mayhemProfitMinUsd', 'Mayhem: take profit at', '$', 1)}
+        ${num('mayhemProfitMaxUsd', 'Mayhem: up to, if flying', '$', 1)}
       </div>
       <div class="section-title">Bot wallet</div>
       <div class="list">
@@ -469,10 +584,10 @@ export class UI {
     const dots = Array.from({ length: steps }, (_, i) => `<i class="${i <= w.step ? 'on' : ''}"></i>`).join('');
     let body = '', foot = '';
     if (w.step === 0) {
-      body = `<div class="hero"><div class="logo" role="img" aria-label="Win Bot"></div><h1>Win Bot</h1><p>A pump.fun trading bot that runs on your iPhone.</p></div>
+      body = `<div class="hero"><div class="logo" role="img" aria-label="Win Bot"></div><h1>Win Bot</h1><p>A pump.fun trading bot that studies every coin before it buys.</p></div>
         <div class="points">
           <div class="point"><span class="n">1</span><p><strong>Practice first</strong>It starts with pretend SOL on real live coins, so you can watch it work.</p></div>
-          <div class="point"><span class="n">2</span><p><strong>It trades by simple rules</strong>Buys new coins that are rising fast with spread-out holders. Sells at your profit target, stop loss or time limit.</p></div>
+          <div class="point"><span class="n">2</span><p><strong>It studies before it buys</strong>It reads every trade on a promising coin for 45 seconds: real buyers, money coming in, whales, and whether the creator is selling. Most coins fail. Only strong ones get bought.</p></div>
           <div class="point"><span class="n">3</span><p><strong>Your keys stay on this phone</strong>The bot has its own wallet. Nothing is sent to any server of ours.</p></div>
         </div>
         ${isIos() && !isStandalone() ? `<div class="alert warn mt"><span class="ico">📲</span><div class="grow"><strong>First, add it to your Home Screen.</strong> Tap ${ICONS.share} Share at the bottom of Safari, then <em>Add to Home Screen</em>, then open Win Bot from your Home Screen and set it up there. The Home Screen app keeps its own data, so a wallet made here in Safari won't show up there.</div></div>` : ''}`;
@@ -512,7 +627,7 @@ export class UI {
       body = `<h1 class="title small">Pick a style</h1><p class="sub" style="margin-top:0">You can change it any time in Settings.</p>
         <div class="stack">${Object.entries(STYLES).map(([k, v]) => `<button class="style-card ${w.style === k ? 'on' : ''}" data-action="wiz-style" data-style="${k}">
           <div class="spread"><strong>${v.label}</strong>${k === 'balanced' ? '<span class="badge real">START HERE</span>' : ''}</div><p>${esc(v.blurb)}</p>
-          <div class="nums"><span>${v.tradeSol} SOL a trade</span><span>Take profit +${v.takeProfitPct}%</span><span>Stop loss −${v.stopLossPct}%</span><span>Max ${v.maxHoldMin} min</span></div></button>`).join('')}</div>`;
+          <div class="nums"><span>${v.tradeSol} SOL a trade</span><span>Score ${v.entry.minScore}+ to buy</span><span>Take profit +${v.takeProfitPct}%</span><span>Stop loss −${v.stopLossPct}%</span></div></button>`).join('')}</div>`;
       foot = `<button class="btn go" data-action="wiz-finish">Finish (starts in Practice)</button><button class="btn ghost" data-action="wiz-back">Back</button>`;
     }
     this.app.innerHTML = `<div class="screen no-tabs wiz"><div class="steps">${dots}</div><div class="body">${body}</div><div class="foot">${foot}</div></div>`;
@@ -560,12 +675,16 @@ export class UI {
           <dt>Market cap</dt><dd>${mcap ? this.mcapText(mcap) + (b.solUsd ? ` (${mcap.toFixed(1)} SOL)` : '') : data.error ? '–' : 'Loading…'}</dd>
           <dt>Curve progress</dt><dd>${data.complete ? 'Graduated' : progress !== undefined ? Math.round(progress * 100) + '%' : '–'}</dd>
           ${c ? `<dt>Age</dt><dd>${ago(c.createdAt)}</dd>` : ''}
-          <dt>Bot's view</dt><dd>${esc(data.error || c?.status || (c?.eval ? c.eval.reason : data.complete ? 'Graduated coins can be sold here, not bought' : 'Not checked'))}</dd>
+          ${c?.solRaised !== undefined ? `<dt>SOL put in</dt><dd>${c.solRaised.toFixed(2)} SOL</dd>` : ''}
+          ${c?.vsLaunch ? `<dt>vs launch price</dt><dd class="${c.vsLaunch >= 1 ? 'up' : 'down'}">${c.vsLaunch.toFixed(2)}×</dd>` : ''}
+          ${c?.isMayhemMode ? '<dt>Type</dt><dd><span class="badge mayhem">MAYHEM</span></dd>' : ''}
+          ${!c?.verdict ? `<dt>Bot's view</dt><dd>${esc(data.error || c?.status || (c?.scan ? c.scan.reason : data.complete ? 'Graduated coins can be sold here, not bought' : 'Not studied'))}</dd>` : ''}
           ${holders ? `<dt>Holders</dt><dd class="${holders.ok ? 'up' : 'down'}">${esc(holders.reason)}</dd>` : ''}
         </dl>
+        ${c?.verdict ? this.studyReport(c) : ''}
         <div class="section-title">Buy with ${mode === 'real' ? 'real SOL' : 'practice SOL'}</div>
         <div class="btn-row ${amounts.length === 3 ? 'three' : ''}" style="grid-template-columns:repeat(${amounts.length},1fr)">${amounts.map((a) => `<button class="btn mode" data-action="buy" data-mint="${esc(data.mint)}" data-sol="${a}" ${this.busyBuys.has(data.mint) || b.buying.has(data.mint) ? 'disabled' : ''}>${this.busyBuys.has(data.mint) || b.buying.has(data.mint) ? '…' : a}</button>`).join('')}</div>
-        <p class="small muted">The bot then sells it by your rules (take profit, stop loss, time limit). ${mode === 'real' ? 'Uses SOL from the bot wallet.' : ''}</p>
+        <p class="small muted">The bot then sells it by your rules (take profit, stop loss, sellers taking over, time limit). ${mode === 'real' ? 'Uses SOL from the bot wallet.' : ''}</p>
         <div class="btn-row mt"><a class="btn" href="https://pump.fun/coin/${esc(data.mint)}" target="_blank" rel="noopener">pump.fun</a><button class="btn" data-action="copy" data-text="${esc(data.mint)}">Copy address</button></div>${close}`;
     } else if (kind === 'pos') {
       const p = b.positions.get(data.id);
@@ -621,15 +740,37 @@ export class UI {
       html = `<h2>Activity</h2>${this.activityList(120)}${close}`;
     } else if (kind === 'help') {
       html = `<div class="help"><h2>How Win Bot works</h2>
-        <h3>What it does</h3><p>It watches every new coin launched on pump.fun. When a coin is rising fast, still early on its curve, and its coins are spread across many wallets, the bot buys a small amount. Then it sells when one of your rules hits: take profit, stop loss, trailing stop, the time limit, or just before the coin graduates.</p>
+        <h3>What it does</h3><p>It watches every new coin launched on pump.fun. When one starts getting real money, the bot studies it: for 45 seconds it reads every buy and sell. It counts real buyers (ignoring bot wallets that buy and sell over and over, and the mayhem agent), how much SOL is coming in versus going out, whether one whale is doing the buying, whether the creator is selling, and whether the price is holding. That becomes a score out of 100. Only coins that pass every check and score high enough get bought, after a last check that the coins are spread across many wallets.</p>
+        <h3>How it sells</h3><p>It watches every trade on coins it holds and sells right away if the creator starts selling, a big holder dumps, or sellers take over. Otherwise it sells at your take profit, stop loss, trailing stop, or time limit, or if the coin is going nowhere. After losses in a row it gets pickier until the next win.</p>
+        <h3>Mayhem coins</h3><p>Mayhem coins have pump.fun's trading agent buying and selling them, which can fake activity. The bot ignores the agent's trades, studies them for 25 seconds, needs a higher score and a clearly rising price, and takes a quick $5 to $10 profit (more only while it's still flying).</p>
+        <h3>Copy trading</h3><p>On the Wallets tab, add a trader by wallet address, pump.fun profile link, or @username. You'll see their pump.fun trades live. Turn on Copy and the bot buys the same coin when they buy (with your amount) and sells the same share when they sell. It skips a copy if the price already ran up 25% since their buy. Your stop loss still protects copied trades.</p>
         <h3>Keep the app open</h3><p>iPhone pauses web apps in the background, so the bot only trades while Win Bot is open on screen. When it's running it keeps the screen on by itself; plug your phone in. If you leave and come back, it checks your trades right away and sells anything that hit a rule.</p>
         <h3>Practice vs real</h3><p>Practice uses pretend SOL with the same live coins and rules, with prices made 2% worse to be realistic. Real mode uses the SOL in your bot wallet.</p>
         <h3>Fees</h3><p>pump.fun charges about 1.25% per trade. Each trade also pays a small network fee (about 0.0001 to 0.0005 SOL depending on Speed). The first trade of each coin puts about 0.002 SOL into a token account; the bot gets it back after selling.</p>
-        <h3>Safety</h3><p>Most pump.fun coins go to zero, and no bot wins every trade. Start in Practice, then use small amounts. The bot never sells coins it didn't buy unless you tap Sell. Every real trade is test-run on the network first and cancelled if it would move more SOL than expected.</p>
+        <h3>Safety</h3><p>Most pump.fun coins go to zero, and no bot wins every trade: the study cuts out a lot of bad coins, but it can't see the future. Start in Practice, then use small amounts. The bot never sells coins it didn't buy unless you tap Sell. Every real trade is test-run on the network first and cancelled if it would move more SOL than expected.</p>
         <h3>If something goes wrong</h3><p>Your SOL is always in the bot wallet on Solana. With your backup key you can open it in Phantom from any device and sell or send anything there.</p></div>${close}`;
     }
     if (this.sheetRendered === kind + JSON.stringify(data)) patch(body, html);
     else { body.innerHTML = html; this.sheetRendered = kind + JSON.stringify(data); }
+  }
+
+  studyReport(c) {
+    const v = c.verdict;
+    const m = v.m || {};
+    const studying = c.stage === 'study';
+    const left = studying ? Math.max(0, Math.ceil((c.studyEnd - Date.now()) / 1000)) : 0;
+    const title = c.stage === 'bought' || c.stage === 'passed' ? 'Passed the study' : studying ? `Studying · ${left}s left` : v.ok ? 'Looked good' : 'Did not pass';
+    const sub = v.ok ? `Score ${v.score} (needs ${v.need})` : v.reason;
+    return `<div class="verdict">${scoreRing(v.score, v.ok ? 'pass' : studying ? '' : 'fail', true)}<div><h4>${esc(title)}</h4><div class="small muted">${esc(sub)}</div></div></div>
+      <dl class="kv mt">
+        <dt>Real buyers</dt><dd>${m.uniqueBuyers ?? '–'}</dd>
+        <dt>Money in, net</dt><dd class="${cls(m.netSol || 0)}">${m.netSol !== undefined ? (m.netSol >= 0 ? '+' : '') + m.netSol.toFixed(2) + ' SOL' : '–'}</dd>
+        <dt>Buys vs sells</dt><dd>${m.buyRatio !== undefined ? Math.round(m.buyRatio * 100) + '% buys' : '–'}</dd>
+        <dt>Trades studied</dt><dd>${m.trades ?? '–'}${m.flippers ? ` (${m.flippers} bot wallet${m.flippers > 1 ? 's' : ''} ignored)` : ''}</dd>
+        <dt>Creator</dt><dd class="${m.creatorSoldSol > 0.05 ? 'down' : ''}">${m.creatorSoldSol > 0.05 ? 'sold ' + m.creatorSoldSol.toFixed(2) + ' SOL' : 'not selling'}</dd>
+      </dl>
+      <div class="report">${v.parts.map((p) => `<div class="bar-line"><span>${esc(p.label)} <span class="small muted">${esc(p.note || '')}</span></span><span class="pts">${p.pts}/${p.max}</span><div class="meter"><i style="width:${p.max ? Math.round((p.pts / p.max) * 100) : 0}%"></i></div></div>`).join('')}</div>
+      ${v.vetoes.length ? `<ul class="reasons">${v.vetoes.slice(0, 5).map((x) => `<li>${esc(x)}</li>`).join('')}</ul>` : '<ul class="reasons"><li class="good">No red flags</li></ul>'}`;
   }
 
   // ---------- dialogs & toasts ----------
@@ -735,7 +876,19 @@ export class UI {
           break;
         }
         case 'set': b.updateSettings({ [t.dataset.key]: t.dataset.value }); this.renderSettings(); break;
-        case 'reset-rules': b.updateSettings({ tradeSol: null, maxOpen: null, takeProfitPct: null, stopLossPct: null, trailStartPct: null, trailDropPct: null, maxHoldMin: null, dailyLossSol: null }); this.renderSettings(); this.toast('Rules reset to the style defaults.'); break;
+        case 'reset-rules': b.updateSettings({ tradeSol: null, maxOpen: null, takeProfitPct: null, stopLossPct: null, trailStartPct: null, trailDropPct: null, maxHoldMin: null, dailyLossSol: null, studySec: 45, mayhemStudySec: 25, mayhemProfitMinUsd: 5, mayhemProfitMaxUsd: 10 }); this.renderSettings(); this.toast('Rules reset to the style defaults.'); break;
+        case 'track': await this.trackWallet(); break;
+        case 'wallet-refresh': b.refreshWallet(t.dataset.address).catch((e2) => this.toast(e2.message)); break;
+        case 'wallet-remove': {
+          const open = [...b.positions.values()].filter((p) => p.copiedFrom === t.dataset.address).length;
+          const ok = await this.confirm({ title: `Stop tracking ${b.walletLabel(t.dataset.address)}?`, text: open ? `You have ${open} open copied trade${open > 1 ? 's' : ''}. They stay open and use your normal rules.` : 'You can add them again any time.', ok: 'Remove', danger: true });
+          if (ok) {
+            for (const p of b.positions.values()) if (p.copiedFrom === t.dataset.address) p.copiedFrom = null;
+            b.untrackWallet(t.dataset.address);
+            this.renderWallets();
+          }
+          break;
+        }
         case 'reset-practice': {
           const ok = await this.confirm({ title: 'Reset practice?', text: `Practice balance goes back to ${b.settings.practiceStartSol} SOL and practice history is cleared.`, ok: 'Reset' });
           if (ok) { b.resetPractice(); this.renderSettings(); }
@@ -793,6 +946,14 @@ export class UI {
     if (t.id === 'wiz-backup') { this.wiz.backupChecked = t.checked; this.renderWizard(); return; }
     if (t.id === 'wiz-key') { this.wiz.key = t.value.trim(); return; }
     if (t.dataset.setting) { this.bot.updateSettings({ [t.dataset.setting]: t.checked }); return; }
+    if (t.dataset.settingInverse) { this.bot.updateSettings({ [t.dataset.settingInverse]: !t.checked }); return; }
+    if (t.dataset.walletCopy) { this.toggleCopy(t.dataset.walletCopy, t); return; }
+    if (t.dataset.walletSol) {
+      try { this.bot.updateWallet(t.dataset.walletSol, { copySol: t.value.replace(',', '.').trim() }); this.toast('Saved.'); }
+      catch (err) { this.toast(err.message); }
+      this.renderWallets();
+      return;
+    }
     if (t.dataset.num) {
       const v = t.value.replace(',', '.').trim();
       if (v === '') { this.bot.updateSettings({ [t.dataset.num]: null }); this.renderSettings(); return; }
@@ -915,6 +1076,42 @@ export class UI {
     this.closeSheet();
     this.renderAll();
     this.openSheet('backup', { show: true });
+  }
+
+  async trackWallet() {
+    const input = document.getElementById('track-input');
+    const v = (input?.value || '').trim();
+    if (!v) { this.toast('Paste a wallet address or @username first.'); return; }
+    this.tracking = true;
+    this.renderWallets();
+    try {
+      const w = await this.bot.trackWallet(v);
+      if (input) input.value = '';
+      this.toast('Tracking ' + this.bot.walletLabel(w.address) + '.');
+    } catch (e) {
+      this.message("Couldn't add that wallet", e.message || String(e));
+    } finally {
+      this.tracking = false;
+      this.renderWallets();
+    }
+  }
+
+  async toggleCopy(address, box) {
+    const b = this.bot;
+    const w = b.wallets.find((x) => x.address === address);
+    if (!w) return;
+    if (box.checked) {
+      const real = b.settings.mode === 'real';
+      const ok = await this.confirm({
+        title: `Copy ${b.walletLabel(address)}?`,
+        text: `Each time they buy a pump.fun coin, the bot buys ${w.copySol} SOL of it${real ? ' with REAL SOL' : ' (practice SOL)'}, and sells when they sell. It only copies while the bot is started.`,
+        ok: 'Copy them', danger: real,
+      });
+      if (!ok) { box.checked = false; return; }
+    }
+    b.updateWallet(address, { copy: box.checked });
+    this.renderWallets();
+    if (box.checked && !b.running) this.toast('Copying is on. Tap Start on Home so the bot can copy.');
   }
 
   async lookupCoin(mint) {

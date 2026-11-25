@@ -118,32 +118,74 @@ export class Rpc {
 }
 
 /**
- * logsSubscribe for transactions mentioning one address, with automatic
- * reconnects. onLogs(signature, logs) is called for successful transactions.
+ * One WebSocket to Solana carrying many logsSubscribe subscriptions (one per
+ * address: new coins, coins being studied, coins held, tracked wallets).
+ * Reconnects by itself and re-subscribes everything. Handlers get
+ * (signature, logs) for successful transactions only.
  */
-export class LogsSubscription {
-  constructor(wsUrl, mention, { onLogs, onStatus, WebSocketImpl } = {}) {
+export class ChainStream {
+  constructor(wsUrl, { WebSocketImpl, onStatus } = {}) {
     this.wsUrl = wsUrl;
-    this.mention = mention;
-    this.onLogs = onLogs || (() => {});
-    this.onStatus = onStatus || (() => {});
     this.WS = WebSocketImpl || globalThis.WebSocket;
+    this.listeners = new Set();
+    if (onStatus) this.listeners.add(onStatus);
+    this.subs = new Map(); // address -> { handlers, subId, reqId, busy }
+    this.bySubId = new Map();
+    this.reqs = new Map(); // request id -> address (this connection only)
     this.ws = null;
     this.stopped = true;
     this.backoff = 1000;
     this.lastMessageAt = 0;
     this.status = 'off';
+    this.nextId = 1;
   }
 
-  _setStatus(s) { if (this.status !== s) { this.status = s; this.onStatus(s); } }
+  onStatus(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); }
+
+  _setStatus(s) {
+    if (this.status === s) return;
+    this.status = s;
+    for (const fn of this.listeners) { try { fn(s); } catch (e) { console.warn('status listener', e); } }
+  }
+
+  get size() { return this.subs.size; }
+  has(address) { return this.subs.has(address); }
+
+  /** Watch transactions that mention `address`. Returns a function that stops watching. */
+  subscribe(address, handler, { busy = false } = {}) {
+    let s = this.subs.get(address);
+    if (!s) {
+      s = { handlers: new Set(), subId: null, reqId: null, busy };
+      this.subs.set(address, s);
+      if (this.ws && this.wsOpen) this._sendSub(address, s);
+    }
+    if (busy) s.busy = true;
+    s.handlers.add(handler);
+    return () => this.unsubscribe(address, handler);
+  }
+
+  unsubscribe(address, handler) {
+    const s = this.subs.get(address);
+    if (!s) return;
+    if (handler) s.handlers.delete(handler);
+    if (handler && s.handlers.size) return;
+    clearTimeout(s.retry);
+    this.subs.delete(address);
+    if (s.subId !== null) {
+      this.bySubId.delete(s.subId);
+      this._send('logsUnsubscribe', [s.subId]);
+    }
+  }
 
   start() {
     if (!this.stopped) return;
     this.stopped = false;
     this._connect();
     this.watchdog = setInterval(() => {
-      if (this.stopped) return;
-      if (this.status === 'live' && Date.now() - this.lastMessageAt > 120000) this._reconnect();
+      if (this.stopped || this.status !== 'live') return;
+      // the new-coin subscription is never quiet for long; quiet ones may be
+      const busy = [...this.subs.values()].some((s) => s.busy);
+      if (Date.now() - this.lastMessageAt > (busy ? 120000 : 600000)) this._reconnect();
     }, 10000);
   }
 
@@ -151,13 +193,34 @@ export class LogsSubscription {
     this.stopped = true;
     clearInterval(this.watchdog);
     clearTimeout(this.retryTimer);
-    try { this.ws?.close(); } catch {}
+    for (const s of this.subs.values()) clearTimeout(s.retry);
+    const ws = this.ws;
     this.ws = null;
+    this.wsOpen = false;
+    try { ws?.close(); } catch {}
     this._setStatus('off');
   }
 
   _reconnect() {
-    try { this.ws?.close(); } catch {}
+    const ws = this.ws;
+    if (!ws) return;
+    // drop it now (some sockets never fire onclose when the network is gone)
+    this.ws = null;
+    this.wsOpen = false;
+    try { ws.close(); } catch {}
+    if (!this.stopped) { this._setStatus('connecting'); this._scheduleRetry(); }
+  }
+
+  _send(method, params) {
+    if (!this.ws || !this.wsOpen) return null;
+    const id = this.nextId++;
+    try { this.ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params })); } catch { return null; }
+    return id;
+  }
+
+  _sendSub(address, s) {
+    const id = this._send('logsSubscribe', [{ mentions: [address] }, { commitment: 'confirmed' }]);
+    if (id !== null) { s.reqId = id; this.reqs.set(id, address); }
   }
 
   _connect() {
@@ -166,29 +229,61 @@ export class LogsSubscription {
     let ws;
     try { ws = new this.WS(this.wsUrl); } catch { this._scheduleRetry(); return; }
     this.ws = ws;
+    this.wsOpen = false;
+    this.nextId = 1;
+    this.reqs = new Map();
+    this.bySubId = new Map();
+    for (const s of this.subs.values()) { s.subId = null; s.reqId = null; clearTimeout(s.retry); }
     ws.onopen = () => {
-      ws.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'logsSubscribe', params: [{ mentions: [this.mention] }, { commitment: 'confirmed' }] }));
+      if (this.ws !== ws) return;
+      this.wsOpen = true;
+      this.lastMessageAt = Date.now();
+      if (!this.subs.size) { this.backoff = 1000; this._setStatus('live'); }
+      for (const [address, s] of this.subs) this._sendSub(address, s);
     };
     ws.onmessage = (ev) => {
+      if (this.ws !== ws) return;
       this.lastMessageAt = Date.now();
       let m;
       try { m = JSON.parse(typeof ev.data === 'string' ? ev.data : ''); } catch { return; }
-      if (m.id === 1) {
-        if (m.error) { this._setStatus('down'); try { ws.close(); } catch {} return; }
+      if (m && m.id !== undefined && this.reqs.has(m.id)) {
+        const address = this.reqs.get(m.id);
+        this.reqs.delete(m.id);
+        const s = this.subs.get(address);
+        if (m.error) {
+          // one refused subscription must not take the others down: retry just this one
+          if (s && s.reqId === m.id) {
+            s.reqId = null;
+            s.fails = (s.fails || 0) + 1;
+            clearTimeout(s.retry);
+            s.retry = setTimeout(() => {
+              if (this.subs.get(address) === s && s.subId === null && s.reqId === null && this.ws === ws && this.wsOpen) this._sendSub(address, s);
+            }, Math.min(60000, 5000 * s.fails));
+          }
+          return;
+        }
+        if (!s || s.reqId !== m.id) { this._send('logsUnsubscribe', [m.result]); return; } // no longer wanted
+        s.subId = m.result;
+        this.bySubId.set(m.result, address);
         this.backoff = 1000;
         this._setStatus('live');
         return;
       }
-      if (m.method === 'logsNotification') {
+      if (m && m.method === 'logsNotification') {
+        const address = this.bySubId.get(m.params?.subscription);
+        const s = address && this.subs.get(address);
         const v = m.params?.result?.value;
-        if (v && !v.err && Array.isArray(v.logs) && typeof v.signature === 'string') {
-          try { this.onLogs(v.signature, v.logs); } catch (e) { console.warn('log handler', e); }
+        if (!s || !v || v.err || !Array.isArray(v.logs) || typeof v.signature !== 'string') return;
+        for (const h of [...s.handlers]) {
+          try { h(v.signature, v.logs); } catch (e) { console.warn('log handler', e); }
         }
       }
     };
     ws.onerror = () => {};
     ws.onclose = () => {
-      if (this.ws === ws) this.ws = null;
+      if (this.ws !== ws) return;
+      this.ws = null;
+      this.wsOpen = false;
       if (this.stopped) return;
       this._setStatus('connecting');
       this._scheduleRetry();

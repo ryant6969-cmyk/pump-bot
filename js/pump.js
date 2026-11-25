@@ -15,6 +15,7 @@ export const TOKEN_2022 = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
 export const ATA_PROGRAM = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
 export const WSOL = 'So11111111111111111111111111111111111111112';
 export const DEFAULT_PUBKEY = SYSTEM_PROGRAM; // 32 zero bytes
+export const MAYHEM_PROGRAM = 'MAyhSmzXzV1pTf7LsNkrNwkWKTo4ougAJ1PPg47MD4e';
 
 export const PUMP_GLOBAL = '4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf';
 export const PUMP_FEE_CONFIG = '8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt';
@@ -41,6 +42,7 @@ const DISC = {
   sellV3: [28, 146, 222, 119, 38, 196, 105, 213],
   ammSellV2: [93, 246, 130, 60, 231, 233, 64, 178],
   createEvent: [27, 114, 169, 77, 222, 235, 99, 118],
+  tradeEvent: [189, 219, 127, 211, 78, 230, 97, 238],
 };
 
 // Standard pump.fun curve: 1,073,000,000 virtual tokens, 30 virtual SOL,
@@ -168,12 +170,44 @@ export function curveMarketCapLamports(curve) {
   return (curve.virtualQuoteReserves * curve.tokenTotalSupply) / curve.virtualTokenReserves;
 }
 
+/**
+ * The curve's launch shape, worked out from its current state alone, so it is
+ * right for any curve (standard, mayhem, custom virtual reserves):
+ * virtual minus real stays constant on both sides, and x*y stays constant.
+ */
+export function curveShape(curve) {
+  const vQ = curve.virtualQuoteReserves, vT = curve.virtualTokenReserves;
+  if (typeof vQ !== 'bigint' || typeof vT !== 'bigint' || typeof curve.realQuoteReserves !== 'bigint' || typeof curve.realTokenReserves !== 'bigint') return null;
+  const base = vQ - curve.realQuoteReserves; // virtual SOL at launch
+  const gap = vT - curve.realTokenReserves; // tokens that are never for sale
+  if (base <= 0n || gap <= 0n || vT <= 0n) return null;
+  const startTokens = (vQ * vT) / base; // virtual tokens at launch
+  const forSale = startTokens - gap; // real tokens at launch
+  if (forSale <= 0n) return null;
+  return { base, gap, startTokens, forSale };
+}
+
 /** 0..1, how far along the curve is towards graduating to PumpSwap. */
 export function curveProgress(curve) {
   if (curve.complete) return 1;
-  const sold = INITIAL_REAL_TOKEN_RESERVES - curve.realTokenReserves;
-  const p = Number(sold) / Number(INITIAL_REAL_TOKEN_RESERVES);
+  const shape = curveShape(curve);
+  const total = shape ? shape.forSale : INITIAL_REAL_TOKEN_RESERVES;
+  const p = Number(total - curve.realTokenReserves) / Number(total);
   return Math.max(0, Math.min(1, p));
+}
+
+/** Price now divided by the price at launch (1 = launch price). */
+export function curvePriceVsLaunch(curve) {
+  const shape = curveShape(curve);
+  if (!shape || curve.virtualTokenReserves <= 0n) return null;
+  const now = Number(curve.virtualQuoteReserves) / Number(curve.virtualTokenReserves);
+  const start = Number(shape.base) / Number(shape.startTokens);
+  return start > 0 ? now / start : null;
+}
+
+/** SOL that buyers have put into the curve, net of sells. */
+export function curveSolRaised(curve) {
+  return Number(curve.realQuoteReserves) / 1e9;
 }
 
 /** Lamports received for selling `tokens` into a PumpSwap pool, after fees. */
@@ -352,7 +386,12 @@ export function decodeCreateEvent(bytes) {
     const creator = addr(bytes, off); off += 32;
     const timestamp = Number(readI64(bytes, off)); off += 8;
     const ev = { name: cleanText(name, 40), symbol: cleanText(symbol, 16), uri: cleanText(uri, 300), mint, bondingCurve, user, creator, timestamp };
-    // virtual_token_reserves, virtual_sol_reserves, real_token_reserves, token_total_supply
+    if (off + 32 <= bytes.length) {
+      ev.virtualTokenReserves = readU64(bytes, off);
+      ev.virtualSolReserves = readU64(bytes, off + 8);
+      ev.realTokenReserves = readU64(bytes, off + 16);
+      ev.tokenTotalSupply = readU64(bytes, off + 24);
+    }
     off += 32;
     if (off + 32 <= bytes.length) { ev.tokenProgram = addr(bytes, off); off += 32; }
     if (off + 2 <= bytes.length) { ev.isMayhemMode = bytes[off] !== 0; ev.isCashback = bytes[off + 1] !== 0; off += 2; }
@@ -364,25 +403,81 @@ export function decodeCreateEvent(bytes) {
 }
 
 /**
- * Find CreateEvents in a transaction's logs. Only "Program data" lines
- * emitted directly by the pump program count, so another program in the
- * same transaction can't fake one.
+ * Decode a pump.fun TradeEvent (one buy or sell on a bonding curve). Amounts
+ * are BigInt lamports / raw tokens; reserves are the curve's state after the trade.
  */
-export function createEventsFromLogs(logs) {
-  const out = [];
+export function decodeTradeEvent(bytes) {
+  if (!hasDisc(bytes, DISC.tradeEvent) || bytes.length < 209) return null;
+  const ev = {
+    mint: addr(bytes, 8),
+    solAmount: readU64(bytes, 40),
+    tokenAmount: readU64(bytes, 48),
+    isBuy: bytes[56] !== 0,
+    user: addr(bytes, 57),
+    timestamp: Number(readI64(bytes, 89)),
+    virtualSolReserves: readU64(bytes, 97),
+    virtualTokenReserves: readU64(bytes, 105),
+    realSolReserves: readU64(bytes, 113),
+    realTokenReserves: readU64(bytes, 121),
+    creator: addr(bytes, 177),
+    solPaired: true,
+  };
+  try {
+    // creator fee bps/fee, track_volume, claimed/unclaimed, volume, timestamp, then ix_name
+    if (bytes.length >= 262) {
+      const [ixName, o] = readString(bytes, 258);
+      ev.ixName = cleanText(ixName, 40);
+      if (o < bytes.length) ev.mayhemMode = bytes[o] !== 0;
+      let q = o + 1 + 32; // cashback bps, cashback, buyback bps, buyback fee
+      if (q + 4 <= bytes.length) {
+        const holders = readU32(bytes, q);
+        q += 4 + holders * 34;
+        if (holders < 1000 && q + 32 <= bytes.length) {
+          ev.quoteMint = addr(bytes, q);
+          ev.solPaired = ev.quoteMint === DEFAULT_PUBKEY || ev.quoteMint === WSOL;
+        }
+      }
+    }
+  } catch { /* the fixed part is enough */ }
+  return ev;
+}
+
+/**
+ * pump.fun events in a transaction's logs: { creates, trades }. Only
+ * "Program data" lines emitted directly by the pump program count, so another
+ * program in the same transaction can't fake one.
+ */
+export function pumpEventsFromLogs(logs) {
+  const creates = [];
+  const trades = [];
   const stack = [];
   for (const line of logs || []) {
+    if (typeof line !== 'string') continue;
     let m;
     if ((m = /^Program (\w+) invoke \[\d+\]$/.exec(line))) { stack.push(m[1]); continue; }
     if ((m = /^Program (\w+) (success|failed)/.exec(line))) { if (stack[stack.length - 1] === m[1]) stack.pop(); continue; }
     if (line.startsWith('Program data: ') && stack[stack.length - 1] === PUMP) {
       let bytes;
       try { bytes = fromBase64(line.slice(14).trim()); } catch { continue; }
-      const ev = decodeCreateEvent(bytes);
-      if (ev && isAddress(ev.mint)) out.push(ev);
+      if (hasDisc(bytes, DISC.tradeEvent)) {
+        const ev = decodeTradeEvent(bytes);
+        if (ev) trades.push(ev);
+      } else if (hasDisc(bytes, DISC.createEvent)) {
+        const ev = decodeCreateEvent(bytes);
+        if (ev && isAddress(ev.mint)) creates.push(ev);
+      }
     }
   }
-  return out;
+  return { creates, trades };
+}
+
+export function createEventsFromLogs(logs) {
+  return pumpEventsFromLogs(logs).creates;
+}
+
+/** The mayhem agent's wallet (it trades mayhem coins from this vault). */
+export async function mayhemAgentAddress() {
+  return pda(['sol-vault'], MAYHEM_PROGRAM);
 }
 
 // ---------- Display helpers ----------

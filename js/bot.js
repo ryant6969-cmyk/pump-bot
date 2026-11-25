@@ -6,14 +6,19 @@ import { isAddress } from './b58.js';
 import { Keypair } from './keys.js';
 import { associatedTokenAddress } from './pda.js';
 import * as pump from './pump.js';
-import { Rpc, normalizeRpcInput } from './rpc.js';
+import { Rpc, ChainStream, normalizeRpcInput } from './rpc.js';
 import { CoinFeed } from './feeds.js';
 import { Trader, TradeError, readMeta } from './trader.js';
-import { DEFAULT_SETTINGS, STYLES, resolveRules, evaluateEntry, evaluateHolders, evaluateExit } from './strategy.js';
+import { DEFAULT_SETTINGS, STYLES, resolveRules, migrateSettings, evaluateScan, evaluateHolders, evaluateExit } from './strategy.js';
+import { Tape, judge, fatalDuringStudy, flowSignals } from './analyst.js';
+import { resolveWallet, walletTradesFromLogs } from './wallets.js';
 import { fromBase64 } from './bytes.js';
 
 const POLL_MS = 2500;
 const MAX_WATCH = 99;
+const MAX_STUDY = 8; // coins studied at the same time (each is a live trade subscription)
+const MAX_WALLETS = 10;
+const MAX_COPY_OPEN = 5;
 const COIN_TTL_MS = 20 * 60_000;
 const MAX_COINS = 400;
 const FEE_BUFFER_SOL = 0.006; // token account rent + network fees for one trade
@@ -23,6 +28,24 @@ const PRACTICE_SLIPPAGE = 98n; // practice fills get 2% worse prices, like a rea
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const short = (a) => (a ? a.slice(0, 4) + '…' + a.slice(-4) : '');
 function dayKey(t) { const d = new Date(t); return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate(); }
+
+function normalizeWallet(w) {
+  const copySol = Number(w.copySol);
+  return {
+    address: w.address,
+    username: typeof w.username === 'string' ? w.username.slice(0, 32) : null,
+    label: typeof w.label === 'string' ? w.label.slice(0, 24) : null,
+    addedAt: w.addedAt || Date.now(),
+    copy: !!w.copy,
+    copySol: copySol > 0 ? Math.min(100, copySol) : 0.05,
+    minLeaderSol: Number(w.minLeaderSol) > 0 ? Number(w.minLeaderSol) : 0.01,
+    trades: Array.isArray(w.trades) ? w.trades.slice(0, 40) : [],
+    holdings: w.holdings && typeof w.holdings === 'object' ? w.holdings : {},
+    lastTradeAt: w.lastTradeAt || 0,
+    seen: new Set(Array.isArray(w.seenList) ? w.seenList : []),
+    balance: null,
+  };
+}
 
 export class Bot extends EventTarget {
   constructor({ store, fetchImpl, WebSocketImpl, now, timing } = {}) {
@@ -58,12 +81,22 @@ export class Bot extends EventTarget {
     this.poolCache = new Map();
     this.buying = new Set();
     this.pollMs = timing?.botPollMs ?? POLL_MS;
+    this.stream = null;
+    this.streamStatus = 'off';
+    this.watches = new Map(); // address -> { unsub, kind, mint|address }
+    this.tapes = new Map(); // mint -> Tape (live trades)
+    this.wallets = [];
+    this.metaCache = new Map();
+    this.pipeline = { scanned: 0, studied: 0, passed: 0, rejected: 0, bought: 0 };
+    this.lossStreak = { practice: 0, real: 0 };
+    this.agentAddr = null;
   }
 
   // ---------- setup & persistence ----------
 
   async init() {
-    this.settings = { ...DEFAULT_SETTINGS, rpcInput: '', backupDone: false, setupDone: false, ...this.store.load('settings', {}) };
+    this.settings = { ...DEFAULT_SETTINGS, rpcInput: '', backupDone: false, setupDone: false, ...migrateSettings(this.store.load('settings', {}) || {}) };
+    this.agentAddr = await pump.mayhemAgentAddress();
     const secret = this.store.load('wallet', null);
     if (secret) {
       try { this.wallet = await Keypair.fromSecretText(secret); }
@@ -78,6 +111,8 @@ export class Bot extends EventTarget {
     this.bought = new Set(st.bought || []);
     this.wasRunning = !!st.running;
     this.activity = st.activity || [];
+    this.lossStreak = st.lossStreak || { practice: 0, real: 0 };
+    this.wallets = (this.store.load('wallets', []) || []).filter((w) => w && isAddress(w.address)).map(normalizeWallet);
     this._connect();
     if (this.rpc && this.wallet) {
       this.refreshBalance().catch(() => {});
@@ -85,17 +120,24 @@ export class Bot extends EventTarget {
     }
     this.refreshSolPrice();
     this.priceTimer = setInterval(() => this.refreshSolPrice(), 5 * 60_000);
+    this._syncWatches();
+    if (this.rpc) for (const w of this.wallets) this.refreshWallet(w.address).catch(() => {});
     this._ensureLoop();
     this._emit();
   }
 
   _save() {
     this.store.save('settings', this.settings);
-    const positions = [...this.positions.values()].map(({ curve, ...p }) => p);
+    const positions = [...this.positions.values()].map(({ curve, liveCurve, ...p }) => p);
     this.store.save('state', {
       positions, history: this.history.slice(0, 300), practice: this.practice, daily: this.daily,
       pending: this.pending, bought: [...this.bought].slice(-500), running: this.running, activity: this.activity.slice(0, 80),
+      lossStreak: this.lossStreak,
     });
+  }
+
+  _saveWallets() {
+    this.store.save('wallets', this.wallets.map(({ seen, balance, loading, ...w }) => ({ ...w, seenList: [...(seen || [])].slice(-60) })));
   }
 
   _emit() {
@@ -119,8 +161,11 @@ export class Bot extends EventTarget {
     const before = this.settings.rpcInput;
     this.settings = { ...this.settings, ...patch };
     if (patch.rpcInput !== undefined && patch.rpcInput !== before) {
+      this.feed?.stop();
+      this.feed = null;
       this._connect();
-      if (this.running) { this.feed?.stop(); this.feed = null; this._startFeed(); }
+      if (this.running) this._startFeed();
+      this._syncWatches();
     }
     this._save();
     this._emit();
@@ -130,6 +175,11 @@ export class Bot extends EventTarget {
     const n = normalizeRpcInput(this.settings.rpcInput);
     this.rpcInfo = n;
     this.rpc = n ? new Rpc(n.http, { fetchImpl: this.fetchImpl, maxPerSecond: 8 }) : null;
+    // one live connection for everything: new coins, studied coins, held coins, tracked wallets
+    const old = this.stream;
+    this.watches.clear();
+    this.stream = n?.ws ? new ChainStream(n.ws, { WebSocketImpl: this.WebSocketImpl, onStatus: (st) => { this.streamStatus = st; this._emit(); } }) : null;
+    old?.stop();
     this.trader = this.rpc && this.wallet ? new Trader({
       rpc: this.rpc, wallet: this.wallet, fetchImpl: this.fetchImpl, timing: this.timing,
       log: (lvl, msg) => this.log(lvl, msg),
@@ -215,6 +265,8 @@ export class Bot extends EventTarget {
     this.running = false;
     this.feed?.stop();
     this.feed = null;
+    this.stream?.stop();
+    this.watches.clear();
     clearInterval(this.priceTimer);
     clearTimeout(this.loopTimer);
     this.loopTimer = null;
@@ -281,7 +333,9 @@ export class Bot extends EventTarget {
     this.wasRunning = false;
     this.pausedReason = null;
     this.failStreak = 0;
+    this.pipeline = { scanned: 0, studied: 0, passed: 0, rejected: 0, bought: 0 };
     this._startFeed();
+    this._syncWatches();
     this._ensureLoop();
     const s = STYLES[this.settings.style]?.label || 'Balanced';
     this.log('info', `Bot started: ${this.settings.mode === 'real' ? 'REAL money' : 'Practice'}, ${s} style.`);
@@ -294,6 +348,8 @@ export class Bot extends EventTarget {
     this.feed?.stop();
     this.feed = null;
     this.feedStatus = { chain: 'off', pumpportal: 'off' };
+    for (const c of this.coins.values()) if (c.stage === 'study' || c.stage === 'passed') { c.stage = 'scan'; c.status = null; }
+    this._syncWatches();
     this.log('info', 'Bot stopped. It still watches open trades until they are sold.');
     this._save();
   }
@@ -308,7 +364,7 @@ export class Bot extends EventTarget {
   _startFeed() {
     if (this.feed) return;
     this.feed = new CoinFeed({
-      wsUrl: this.rpcInfo?.ws,
+      stream: this.stream,
       WebSocketImpl: this.WebSocketImpl,
       onStatus: (s) => { this.feedStatus = { ...s }; this._emit(); },
       onCoin: (c) => this._addCoin(c),
@@ -318,11 +374,12 @@ export class Bot extends EventTarget {
 
   /** Called when the app comes back to the screen. */
   async onResume(hiddenMs) {
-    if (hiddenMs > 20000 && this.running) {
-      this.feed?.stop();
-      this.feed = null;
-      this._startFeed();
+    if (hiddenMs > 20000) {
+      // iOS froze the app: the live connection is probably dead, so open a fresh one
+      this.stream?._reconnect();
+      if (this.running) { this.feed?.portal?.stop(); this.feed?.portal?.start(); }
     }
+    if (hiddenMs > 5000) for (const w of this.wallets) this.refreshWallet(w.address).catch(() => {});
     clearTimeout(this.loopTimer);
     this.loopTimer = null;
     this._ensureLoop();
@@ -335,9 +392,20 @@ export class Bot extends EventTarget {
   // ---------- coins ----------
 
   async _addCoin(c) {
-    if (this.coins.has(c.mint)) return;
-    const coin = { ...c, curveAddr: null, snaps: [], curve: null, eval: null, holders: null, holderCheckedAt: 0, watching: true };
+    const existing = this.coins.get(c.mint);
+    if (existing) {
+      // the second feed reported it too: fill in anything the first one didn't know
+      for (const k of ['creator', 'tokenProgram', 'isMayhemMode', 'devBuySol', 'devBuyTokens', 'createSig']) {
+        if ((existing[k] === null || existing[k] === undefined) && c[k] !== null && c[k] !== undefined) existing[k] = c[k];
+      }
+      this.tapes.get(c.mint)?.setCreator(existing.creator);
+      return;
+    }
+    if (c.update) return;
+    const coin = { ...c, curveAddr: null, snaps: [], curve: null, verdict: null, scan: null, holders: null, holderCheckedAt: 0, watching: true, stage: 'scan', studies: 0 };
+    delete coin.update;
     this.coins.set(c.mint, coin);
+    this.pipeline.scanned++;
     coin.curveAddr = await pump.bondingCurveAddress(c.mint);
     if (this.coins.size > MAX_COINS) this._pruneCoins(this.now(), true);
     this._emit();
@@ -345,28 +413,99 @@ export class Bot extends EventTarget {
 
   _pruneCoins(now, force = false) {
     const held = new Set([...this.positions.values()].map((p) => p.mint));
+    const keep = (c) => held.has(c.mint) || c.stage === 'study' || c.stage === 'passed';
     for (const [m, c] of this.coins) {
-      if (held.has(m)) continue;
+      if (keep(c)) continue;
       if (now - c.createdAt > COIN_TTL_MS) this.coins.delete(m);
     }
     if (force && this.coins.size > MAX_COINS) {
-      const old = [...this.coins.values()].filter((c) => !held.has(c.mint)).sort((a, b) => a.createdAt - b.createdAt);
+      const old = [...this.coins.values()].filter((c) => !keep(c)).sort((a, b) => a.createdAt - b.createdAt);
       for (const c of old.slice(0, this.coins.size - MAX_COINS)) this.coins.delete(c.mint);
     }
   }
 
   _coinsToWatch(now, capacity) {
     const maxAge = this.rules().entry.maxAgeMin * 60_000;
-    const list = [...this.coins.values()].filter((c) => c.curveAddr && c.watching && now - c.createdAt <= maxAge);
-    // newest first, then the ones already moving
-    list.sort((a, b) => (b.lastProgress || 0) - (a.lastProgress || 0) || b.createdAt - a.createdAt);
+    const live = [...this.coins.values()].filter((c) => c.curveAddr && (c.stage === 'study' || c.stage === 'passed'));
+    const list = [...this.coins.values()].filter((c) => c.curveAddr && c.watching && c.stage !== 'study' && c.stage !== 'passed' && now - c.createdAt <= maxAge);
+    // the newest coins first, then the ones with money coming in
     const young = list.filter((c) => now - c.createdAt < 90_000).sort((a, b) => b.createdAt - a.createdAt);
-    const rest = list.filter((c) => now - c.createdAt >= 90_000);
-    return [...young, ...rest].slice(0, Math.max(0, capacity));
+    const rest = list.filter((c) => now - c.createdAt >= 90_000).sort((a, b) => (b.solRaised || 0) - (a.solRaised || 0));
+    return [...live, ...young, ...rest].slice(0, Math.max(0, capacity));
   }
 
   _openPositions(mode = null) {
     return [...this.positions.values()].filter((p) => !mode || p.mode === mode);
+  }
+
+  /** Being pickier after losses in a row: extra points the score needs. */
+  pickiness(mode = this.settings.mode) {
+    return Math.min(15, (this.lossStreak?.[mode] || 0) * 4);
+  }
+
+  // ---------- live trades (one subscription per address) ----------
+
+  _tape(mint) {
+    let t = this.tapes.get(mint);
+    if (!t) {
+      const c = this.coins.get(mint);
+      const p = this.positions.get('real:' + mint) || this.positions.get('practice:' + mint);
+      t = new Tape({ mint, creator: c?.creator || p?.creator || null, ignore: [this.wallet?.address, this.agentAddr] });
+      this.tapes.set(mint, t);
+    }
+    return t;
+  }
+
+  /** Subscribe to exactly what's needed right now: studied coins, held coins, tracked wallets. */
+  _syncWatches() {
+    if (!this.stream || this.disposed) return;
+    const want = new Map();
+    for (const p of this.positions.values()) if (p.curveAddr && !p.complete) want.set(p.curveAddr, { kind: 'curve', mint: p.mint });
+    for (const c of this.coins.values()) if ((c.stage === 'study' || c.stage === 'passed') && c.curveAddr) want.set(c.curveAddr, { kind: 'curve', mint: c.mint });
+    for (const w of this.wallets) want.set(w.address, { kind: 'wallet', address: w.address });
+    for (const [addr, h] of this.watches) {
+      if (want.has(addr)) continue;
+      h.unsub();
+      this.watches.delete(addr);
+      if (h.kind === 'curve' && ![...this.positions.values()].some((p) => p.mint === h.mint)) this.tapes.delete(h.mint);
+    }
+    for (const [addr, info] of want) {
+      if (this.watches.has(addr)) continue;
+      const handler = info.kind === 'curve' ? (sig, logs) => this._onCurveLogs(info.mint, sig, logs) : (sig, logs) => this._onWalletLogs(info.address, sig, logs);
+      this.watches.set(addr, { ...info, unsub: this.stream.subscribe(addr, handler) });
+    }
+    const needed = this.running || want.size > 0;
+    if (needed && this.stream.stopped) this.stream.start();
+    else if (!needed && !this.stream.stopped) this.stream.stop();
+  }
+
+  _onCurveLogs(mint, sig, logs) {
+    const trades = pump.pumpEventsFromLogs(logs).trades.filter((t) => t.mint === mint);
+    if (!trades.length) return;
+    const now = this.now();
+    const tape = this._tape(mint);
+    for (const ev of trades) tape.add(ev, now, sig);
+    const ev = trades[trades.length - 1];
+    const curve = {
+      virtualTokenReserves: ev.virtualTokenReserves, virtualQuoteReserves: ev.virtualSolReserves,
+      realTokenReserves: ev.realTokenReserves, realQuoteReserves: ev.realSolReserves, complete: ev.realTokenReserves === 0n,
+    };
+    for (const mode of ['practice', 'real']) {
+      const p = this.positions.get(mode + ':' + mint);
+      if (!p || p.state === 'selling') continue;
+      // value it from this exact trade, no waiting for the next price check
+      if (!curve.complete) {
+        p.liveCurve = curve;
+        p.lastValueLamports = pump.curveSellLamportsOut(curve, BigInt(p.tokens));
+        p.valuedAt = now;
+        p.progress = pump.curveProgress(curve);
+        if (BigInt(p.peakValueLamports || 0n) < p.lastValueLamports) p.peakValueLamports = p.lastValueLamports;
+      }
+      this._maybeExit(p, now);
+    }
+    const c = this.coins.get(mint);
+    if (c) c.lastTradeAt = now;
+    this._emit();
   }
 
   // ---------- main loop ----------
@@ -418,46 +557,56 @@ export class Bot extends EventTarget {
     // read each new coin's mint once to learn its token program and name
     const needMint = [...this.coins.values()].filter((c) => !c.tokenProgram && seen.has(c.curveAddr)).slice(0, Math.max(0, 100 - addrs.length));
     for (const c of needMint) add(c.mint);
-    if (!addrs.length) return;
-    const res = await this.rpc.call('getMultipleAccounts', [addrs, { encoding: 'base64', commitment: 'confirmed' }]);
-    const byAddr = new Map();
-    res.value.forEach((a, i) => { if (a) byAddr.set(addrs[i], { owner: a.owner, data: fromBase64(a.data[0]) }); });
-    for (const c of needMint) {
-      const m = byAddr.get(c.mint);
-      if (m && (m.owner === pump.TOKEN || m.owner === pump.TOKEN_2022)) c.tokenProgram = m.owner;
+    if (addrs.length) {
+      const res = await this.rpc.call('getMultipleAccounts', [addrs, { encoding: 'base64', commitment: 'confirmed' }]);
+      const byAddr = new Map();
+      res.value.forEach((a, i) => { if (a) byAddr.set(addrs[i], { owner: a.owner, data: fromBase64(a.data[0]) }); });
+      for (const c of needMint) {
+        const m = byAddr.get(c.mint);
+        if (m && (m.owner === pump.TOKEN || m.owner === pump.TOKEN_2022)) c.tokenProgram = m.owner;
+      }
+      const t = this.now();
+      for (const c of watch) {
+        const acc = byAddr.get(c.curveAddr);
+        const curve = acc && acc.owner === pump.PUMP ? pump.decodeBondingCurve(acc.data) : null;
+        if (!curve) continue;
+        this._recordCurve(c, curve, t);
+      }
+      for (const p of positions) {
+        const acc = byAddr.get(p.curveAddr);
+        const curve = acc && acc.owner === pump.PUMP ? pump.decodeBondingCurve(acc.data) : null;
+        await this._valuePosition(p, curve, t);
+      }
+      this.lastPollAt = t;
     }
     const t = this.now();
-    for (const c of watch) {
-      const acc = byAddr.get(c.curveAddr);
-      const curve = acc && acc.owner === pump.PUMP ? pump.decodeBondingCurve(acc.data) : null;
-      if (!curve) continue;
-      this._recordCurve(c, curve, t);
-    }
-    for (const p of positions) {
-      const acc = byAddr.get(p.curveAddr);
-      const curve = acc && acc.owner === pump.PUMP ? pump.decodeBondingCurve(acc.data) : null;
-      await this._valuePosition(p, curve, t);
-    }
-    this.lastPollAt = t;
     for (const p of positions) this._maybeExit(p, t);
-    if (this.running && this.settings.autoBuy) this._maybeEnter(t);
+    if (this.running) {
+      this._study(t);
+      if (this.settings.autoBuy) this._maybeEnter(t);
+    }
+    this._syncWatches();
     this._emit();
   }
 
   _recordCurve(c, curve, t) {
     const mcap = pump.lamportsToSol(pump.curveMarketCapLamports(curve));
     const progress = pump.curveProgress(curve);
+    const sol = pump.curveSolRaised(curve);
+    const vsl = pump.curvePriceVsLaunch(curve);
     c.curve = { complete: curve.complete, isMayhemMode: curve.isMayhemMode, isCashbackCoin: curve.isCashbackCoin, solPaired: pump.isSolPaired(curve), depth: curve.depth, tokenTotalSupply: curve.tokenTotalSupply };
     if (c.isMayhemMode === null || c.isMayhemMode === undefined) c.isMayhemMode = curve.isMayhemMode;
-    if (!c.creator || c.creator === pump.DEFAULT_PUBKEY) c.creator = curve.creator;
-    c.snaps.push({ t, mcap, progress });
-    if (c.snaps.length > 80) c.snaps.splice(0, c.snaps.length - 80);
+    if (!c.creator || c.creator === pump.DEFAULT_PUBKEY) { c.creator = curve.creator; this.tapes.get(c.mint)?.setCreator(c.creator); }
+    c.snaps.push({ t, mcap, progress, sol, vsl });
+    if (c.snaps.length > 120) c.snaps.splice(0, c.snaps.length - 120);
     c.lastMcap = mcap;
     c.lastProgress = progress;
+    c.solRaised = sol;
+    c.vsLaunch = vsl;
     const peak = Math.max(...c.snaps.map((s) => s.mcap));
     // stop watching coins that died
     const age = t - c.createdAt;
-    if ((age > 180_000 && progress < 0.02) || (age > 60_000 && mcap < peak * 0.4) || curve.complete) c.watching = false;
+    if (c.stage !== 'study' && c.stage !== 'passed' && ((age > 180_000 && sol < 0.5) || (age > 60_000 && mcap < peak * 0.4) || curve.complete)) c.watching = false;
   }
 
   async _valuePosition(p, curve, t) {
@@ -465,7 +614,10 @@ export class Bot extends EventTarget {
       p.complete = curve.complete;
       p.progress = pump.curveProgress(curve);
       p.mcapSol = pump.lamportsToSol(pump.curveMarketCapLamports(curve));
+      if (!p.creator && curve.creator !== pump.DEFAULT_PUBKEY) { p.creator = curve.creator; this.tapes.get(p.mint)?.setCreator(p.creator); }
+      if (p.mayhem === undefined) p.mayhem = curve.isMayhemMode;
       if (!curve.complete) {
+        p.liveCurve = curve;
         p.lastValueLamports = pump.curveSellLamportsOut(curve, BigInt(p.tokens));
         p.valuedAt = t;
       }
@@ -498,6 +650,79 @@ export class Bot extends EventTarget {
     return pump.poolSellLamportsOut(pool.base, pool.quote, tokens);
   }
 
+  // ---------- studying coins ----------
+
+  _judge(c, rules, now) {
+    const last = c.snaps[c.snaps.length - 1];
+    const recent = c.snaps.filter((x) => x.t >= now - 120_000);
+    const peak = recent.length ? Math.max(...recent.map((x) => x.mcap)) : 0;
+    return judge({
+      tape: this._tape(c.mint), studyStart: c.studyStart, now, coin: c, curve: c.curve || {},
+      solRaised: last?.sol, vsLaunch: last?.vsl, progress: last?.progress, peakMcap2m: peak, mcap: last?.mcap,
+      rules, pickiness: this.pickiness(), creatorSoldBefore: c.creatorSoldBefore,
+    });
+  }
+
+  _reject(c, reason, now) {
+    // keep the report honest: fresh numbers, and the real reason first
+    if (c.studyStart && this.tapes.has(c.mint)) {
+      try { c.verdict = this._judge(c, this.rules(), now); } catch { /* keep the last one */ }
+    }
+    if (c.verdict) c.verdict = { ...c.verdict, ok: false, reason, vetoes: [reason, ...c.verdict.vetoes.filter((x) => x !== reason)] };
+    c.stage = 'rejected';
+    c.rejectedAt = now;
+    c.rejectSol = c.solRaised || 0;
+    c.status = reason;
+    if (/Creator/.test(reason)) c.noRestudy = true;
+    this.pipeline.rejected++;
+  }
+
+  _canRestudy(c, now) {
+    return !c.noRestudy && c.studies < 3 && now - (c.rejectedAt || 0) > 60_000 && (c.solRaised || 0) - (c.rejectSol || 0) >= 1.5;
+  }
+
+  _study(now) {
+    const rules = this.rules();
+    const mode = this.settings.mode;
+    let studying = 0;
+    for (const c of this.coins.values()) {
+      if (c.stage === 'study') {
+        const fatal = fatalDuringStudy(this._tape(c.mint), c.studyStart, now, c);
+        if (fatal) { this._reject(c, fatal, now); continue; }
+        c.verdict = this._judge(c, rules, now);
+        if (now >= c.studyEnd) {
+          if (c.verdict.ok) { c.stage = 'passed'; c.passedAt = now; c.status = c.verdict.reason; this.pipeline.passed++; }
+          else this._reject(c, c.verdict.reason, now);
+        } else { studying++; c.status = 'Studying'; }
+      } else if (c.stage === 'passed' && now - c.passedAt > 20_000) {
+        this._reject(c, 'Missed the moment', now);
+      }
+    }
+    let slots = MAX_STUDY - studying;
+    if (slots <= 0) return;
+    const cands = [];
+    for (const c of this.coins.values()) {
+      if (!c.watching || !c.curve || !c.tokenProgram) continue;
+      if (c.stage !== 'scan' && !(c.stage === 'rejected' && this._canRestudy(c, now))) continue;
+      if (this.positions.has(mode + ':' + c.mint) || this.bought.has(mode + ':' + c.mint)) continue;
+      c.scan = evaluateScan(c, rules, now);
+      if (c.stage === 'scan') c.status = c.scan.ok ? null : c.scan.reason;
+      if (c.scan.ok) cands.push(c);
+    }
+    cands.sort((a, b) => (b.scan.inflow20 || 0) - (a.scan.inflow20 || 0));
+    for (const c of cands) {
+      if (slots-- <= 0) break;
+      const mayhem = !!(c.curve?.isMayhemMode || c.isMayhemMode);
+      c.stage = 'study';
+      c.studies++;
+      c.studyStart = now;
+      c.studyEnd = now + (mayhem ? rules.mayhemStudySec : rules.studySec) * 1000;
+      c.verdict = null;
+      c.status = 'Studying';
+      this.pipeline.studied++;
+    }
+  }
+
   // ---------- buying ----------
 
   _maybeEnter(now) {
@@ -505,7 +730,7 @@ export class Bot extends EventTarget {
     const mode = this.settings.mode;
     this.entryBlock = null;
     if (this.pausedReason) { this.entryBlock = this.pausedReason; return; }
-    const mine = this._openPositions(mode).filter((p) => !p.found);
+    const mine = this._openPositions(mode).filter((p) => !p.found && !p.copiedFrom);
     if (mine.length >= rules.maxOpen) { this.entryBlock = `Holding ${mine.length} of ${rules.maxOpen} trades`; return; }
     const lossToday = -pump.lamportsToSol(this.daily[mode] || 0n);
     if (lossToday >= rules.dailyLossSol) {
@@ -517,16 +742,15 @@ export class Bot extends EventTarget {
     const needLamports = pump.solToLamports(rules.tradeSol + (mode === 'real' ? rules.keepSolReserve + FEE_BUFFER_SOL : 0.001));
     if (this.availableLamports(mode) < needLamports) { this.entryBlock = 'Not enough SOL for another trade'; return; }
     if (this.buyInFlight || now - this.lastBuyAt < 8000) return;
-    const ready = [];
-    for (const c of this.coins.values()) {
-      if (!c.watching || !c.curve || !c.tokenProgram) continue;
-      if (this.bought.has(mode + ':' + c.mint) || this.positions.has(mode + ':' + c.mint)) continue;
-      c.eval = evaluateEntry({ ...c, curve: { ...c.curve, isMayhemMode: c.curve.isMayhemMode } }, rules, now);
-      if (c.eval.ok && !(c.holders && !c.holders.ok && now - c.holderCheckedAt < 30_000)) ready.push(c);
-    }
+    const ready = [...this.coins.values()].filter((c) => c.stage === 'passed' && !this.positions.has(mode + ':' + c.mint) && !this.bought.has(mode + ':' + c.mint));
     if (!ready.length) return;
-    ready.sort((a, b) => (b.eval.rise60 || 0) - (a.eval.rise60 || 0));
-    this._checkAndBuy(ready[0], rules);
+    // one last look with the newest numbers, right before buying
+    for (const c of ready) {
+      c.verdict = this._judge(c, rules, now);
+      if (!c.verdict.ok) this._reject(c, c.verdict.reason, now);
+    }
+    const good = ready.filter((c) => c.stage === 'passed').sort((a, b) => b.verdict.score - a.verdict.score);
+    if (good.length) this._checkAndBuy(good[0], rules);
   }
 
   async _checkAndBuy(coin, rules) {
@@ -537,14 +761,19 @@ export class Bot extends EventTarget {
       const h = await this._holderCheck(coin, rules);
       coin.holders = h;
       coin.holderCheckedAt = this.now();
-      if (!h.ok) { coin.status = 'Skipped: ' + h.reason; return; }
+      if (!h.ok) { this._reject(coin, h.reason, this.now()); if (/Creator/.test(h.reason)) coin.noRestudy = true; return; }
       if (!this.running) return;
       coin.status = 'Buying';
-      await this._buy(coin.mint, rules.tradeSol, 'auto');
+      await this._buy(coin.mint, rules.tradeSol, 'auto', { mayhem: !!coin.curve?.isMayhemMode, score: coin.verdict?.score ?? null });
+      coin.stage = 'bought';
+      coin.status = 'Bought';
+      this.pipeline.bought++;
     } catch (e) {
       coin.status = 'Buy failed';
+      if (coin.stage === 'passed') coin.stage = 'rejected';
     } finally {
       this.buyInFlight = false;
+      this._syncWatches();
       this._emit();
     }
   }
@@ -553,8 +782,12 @@ export class Bot extends EventTarget {
     const r = await this.rpc.call('getTokenLargestAccounts', [coin.mint, { commitment: 'confirmed' }]);
     const holders = (r.value || []).map((h) => ({ address: h.address, amount: BigInt(h.amount) }));
     const curveAta = await associatedTokenAddress(coin.curveAddr, coin.mint, coin.tokenProgram);
+    const agentAta = this.agentAddr ? await associatedTokenAddress(this.agentAddr, coin.mint, coin.tokenProgram) : null;
     const devAta = coin.creator && coin.creator !== pump.DEFAULT_PUBKEY ? await associatedTokenAddress(coin.creator, coin.mint, coin.tokenProgram) : null;
-    return evaluateHolders({ holders, supply: coin.curve?.tokenTotalSupply || 1_000_000_000_000_000n, excludeAddresses: [curveAta], devAccount: devAta }, rules);
+    return evaluateHolders({
+      holders, supply: coin.curve?.tokenTotalSupply || 1_000_000_000_000_000n, excludeAddresses: [curveAta, agentAta],
+      devAccount: devAta, devBought: coin.devBuyTokens ? BigInt(coin.devBuyTokens) : null,
+    }, rules);
   }
 
   /** Buy now, from the bot (auto) or from a tap (manual). */
@@ -579,7 +812,7 @@ export class Bot extends EventTarget {
     }
   }
 
-  async _buy(mint, sol, source) {
+  async _buy(mint, sol, source, extra = {}) {
     const mode = this.settings.mode;
     const id = mode + ':' + mint;
     const rules = this.rules();
@@ -603,7 +836,7 @@ export class Bot extends EventTarget {
         if (this.practice.balance < cost) throw new TradeError('Not enough practice SOL.', { kind: 'funds' });
         this.practice.balance -= cost;
         name = name || st.meta?.name; symbol = symbol || st.meta?.symbol;
-        pos = { tokens, costLamports: cost, tokenProgram: st.tokenProgram, via: 'practice', buySig: null };
+        pos = { tokens, costLamports: cost, tokenProgram: st.tokenProgram, via: 'practice', buySig: null, mayhem: !!c.isMayhemMode, creator: c.creator };
       } else {
         const r = await this._queueTrade(() => this.trader.buy({ mint, lamports, slippagePct: rules.buySlippagePct, speed: rules.speed }), 'buy');
         let tokens = r.tokDelta;
@@ -626,7 +859,8 @@ export class Bot extends EventTarget {
         id, mode, mint, name: name || 'Coin ' + short(mint), symbol: symbol || short(mint),
         curveAddr: await pump.bondingCurveAddress(mint), source, managed: true,
         openedAt: this.now(), peakValueLamports: 0n, lastValueLamports: undefined, state: 'open', sellAttempts: 0, nextSellAt: 0,
-        ...pos,
+        creator: coin?.creator || null,
+        ...pos, ...extra,
       };
       const existing = this.positions.get(id);
       if (existing) {
@@ -638,8 +872,10 @@ export class Bot extends EventTarget {
       }
       if (coin) coin.status = 'Bought';
       try { const st = await this._readCoin(mint); await this._valuePosition(p, st.curve, this.now()); } catch { /* valued on the next check */ }
-      this.log('buy', `Bought ${p.symbol} for ${sol} SOL${mode === 'practice' ? ' (practice)' : ''}.`, { mint, sig: p.buySig });
+      const why = source === 'copy' ? ` (copying ${this.walletLabel(extra.copiedFrom)})` : extra.score !== undefined && extra.score !== null ? ` (score ${extra.score})` : '';
+      this.log('buy', `Bought ${p.symbol} for ${sol} SOL${why}${mode === 'practice' ? ' (practice)' : ''}.`, { mint, sig: p.buySig });
       this._save();
+      this._syncWatches();
       this._ensureLoop();
       return p;
     } catch (e) {
@@ -692,7 +928,9 @@ export class Bot extends EventTarget {
     if (p.sellRequested) { this._sell(p, p.sellRequested); return; }
     if (!p.managed || p.lastValueLamports === undefined) return;
     if (p.valuedAt && now - p.valuedAt > 20_000 && !p.complete) return; // stale price: don't act on it
-    const d = evaluateExit({ ...p, openedAt: p.openedAt }, p.lastValueLamports, this.rules(), { progress: p.progress ?? 0, complete: !!p.complete }, now);
+    const tape = this.tapes.get(p.mint);
+    const flow = tape ? flowSignals(tape, now, { since: p.openedAt }) : null;
+    const d = evaluateExit(p, p.lastValueLamports, this.rules(), { progress: p.progress ?? 0, complete: !!p.complete, flow, solUsd: this.solUsd }, now);
     if (d.sell) this._sell(p, d.reason);
   }
 
@@ -778,19 +1016,72 @@ export class Bot extends EventTarget {
     if (pnl !== null && !p.found) {
       this._rollDay();
       this.daily[p.mode] = (this.daily[p.mode] || 0n) + pnl;
+      if (p.source === 'auto') this.lossStreak[p.mode] = pnl < 0n ? (this.lossStreak[p.mode] || 0) + 1 : 0;
     }
     this.history.unshift({
       id: p.id + ':' + this.now(), mode: p.mode, mint: p.mint, name: p.name, symbol: p.symbol,
       openedAt: p.openedAt, closedAt: this.now(), costLamports: cost, proceedsLamports: proceeds, pnlLamports: pnl,
-      reason, buySig: p.buySig || null, sellSig: sig, via, found: !!p.found,
+      reason, buySig: p.buySig || null, sellSig: sig, via, found: !!p.found, source: p.source || null, copiedFrom: p.copiedFrom || null, score: p.score ?? null,
     });
     if (this.history.length > 300) this.history.length = 300;
+    queueMicrotask(() => this._syncWatches());
     if (p.mode === 'real') this._clearAlert('fees');
     const pct = pnl !== null && cost > 0n ? (Number(pnl) / Number(cost)) * 100 : null;
     this.log(pnl !== null && pnl >= 0n ? 'win' : 'loss',
       `Sold ${p.symbol}${pct !== null ? ` ${pct >= 0 ? '+' : ''}${pct.toFixed(0)}%` : ''} (${reason})${p.mode === 'practice' ? ' (practice)' : ''}.`, { mint: p.mint, sig });
     this._save();
     this._emit();
+  }
+
+  /** Sell part of a position (copy trading: the wallet you copy sold part of theirs). */
+  async _sellPart(p, fraction, reason) {
+    if (p.state === 'selling' || p.closed) return;
+    const tokens = BigInt(p.tokens);
+    let amount = (tokens * BigInt(Math.round(Math.max(0, Math.min(1, fraction)) * 10000))) / 10000n;
+    if (amount <= 0n) return;
+    if (amount * 100n >= tokens * 90n) { this._sell(p, reason); return; }
+    p.state = 'selling';
+    p.sellReason = reason;
+    this._emit();
+    const rules = this.rules();
+    try {
+      let proceeds, sig = null, via = 'practice';
+      if (p.mode === 'practice') {
+        const value = p.liveCurve ? pump.curveSellLamportsOut(p.liveCurve, amount) : (BigInt(p.lastValueLamports ?? 0n) * amount) / tokens;
+        proceeds = (value * PRACTICE_SLIPPAGE) / 100n - PRACTICE_FEE;
+        if (proceeds < 0n) proceeds = 0n;
+        this.practice.balance += proceeds;
+      } else {
+        const r = await this._queueTrade(() => this.trader.sell({ mint: p.mint, tokenProgram: p.tokenProgram, amount, slippagePct: rules.sellSlippagePct, speed: rules.speed }), 'sell');
+        proceeds = r.solDelta;
+        sig = r.sig;
+        via = r.via;
+        if (r.tokensSold > 0n && r.tokensSold <= tokens) amount = r.tokensSold;
+        this.refreshBalance().catch(() => {});
+      }
+      const cost = BigInt(p.costLamports || 0n);
+      const costPart = (cost * amount) / tokens;
+      const left = tokens - amount;
+      p.tokens = left;
+      p.costLamports = cost - costPart;
+      if (p.peakValueLamports) p.peakValueLamports = (BigInt(p.peakValueLamports) * left) / tokens;
+      if (p.lastValueLamports !== undefined) p.lastValueLamports = (BigInt(p.lastValueLamports) * left) / tokens;
+      const pnl = proceeds === null ? null : BigInt(proceeds) - costPart;
+      if (pnl !== null) { this._rollDay(); this.daily[p.mode] = (this.daily[p.mode] || 0n) + pnl; }
+      this.history.unshift({
+        id: p.id + ':' + this.now() + ':part', mode: p.mode, mint: p.mint, name: p.name, symbol: p.symbol,
+        openedAt: p.openedAt, closedAt: this.now(), costLamports: costPart, proceedsLamports: proceeds, pnlLamports: pnl,
+        reason, buySig: p.buySig || null, sellSig: sig, via, found: false, partial: true, source: p.source || null, copiedFrom: p.copiedFrom || null,
+      });
+      const pct = pnl !== null && costPart > 0n ? (Number(pnl) / Number(costPart)) * 100 : null;
+      this.log(pnl !== null && pnl >= 0n ? 'win' : 'loss', `Sold ${Math.round(fraction * 100)}% of ${p.symbol}${pct !== null ? ` ${pct >= 0 ? '+' : ''}${pct.toFixed(0)}%` : ''} (${reason})${p.mode === 'practice' ? ' (practice)' : ''}.`, { mint: p.mint, sig });
+    } catch (e) {
+      this.log('error', `Couldn't sell part of ${p.symbol}: ${e.message}`, { mint: p.mint, sig: e.sig || null });
+    } finally {
+      if (this.positions.get(p.id) === p && p.state === 'selling') p.state = 'open';
+      this._save();
+      this._emit();
+    }
   }
 
   async _landedSell(p) {
@@ -940,14 +1231,202 @@ export class Bot extends EventTarget {
     }
   }
 
+  // ---------- wallet tracker & copy trading ----------
+
+  walletLabel(address) {
+    const w = this.wallets.find((x) => x.address === address);
+    return w?.username ? '@' + w.username : w?.label || short(address);
+  }
+
+  /** Start tracking a wallet (an address, a pump.fun profile link or an @username). */
+  async trackWallet(text) {
+    const { address, username } = await resolveWallet(text, this.fetchImpl);
+    if (this.wallet && address === this.wallet.address) throw new Error("That's the bot's own wallet.");
+    if (this.wallets.some((w) => w.address === address)) throw new Error('You already track this wallet.');
+    if (this.wallets.length >= MAX_WALLETS) throw new Error(`You can track up to ${MAX_WALLETS} wallets. Remove one first.`);
+    const w = normalizeWallet({ address, username, addedAt: this.now() });
+    this.wallets.unshift(w);
+    this._saveWallets();
+    this._syncWatches();
+    this._emit();
+    this.refreshWallet(address, { initial: true }).catch(() => {});
+    return w;
+  }
+
+  untrackWallet(address) {
+    this.wallets = this.wallets.filter((w) => w.address !== address);
+    this._saveWallets();
+    this._syncWatches();
+    this._emit();
+  }
+
+  updateWallet(address, patch) {
+    const w = this.wallets.find((x) => x.address === address);
+    if (!w) return;
+    if (patch.copy !== undefined) w.copy = !!patch.copy;
+    if (patch.copySol !== undefined) {
+      const v = Number(patch.copySol);
+      if (!(v > 0)) throw new Error('Enter how much SOL to spend on each copied trade.');
+      w.copySol = Math.min(100, Math.max(0.001, v));
+    }
+    if (patch.label !== undefined) w.label = String(patch.label || '').slice(0, 24) || null;
+    this._saveWallets();
+    this._emit();
+  }
+
+  /** Balance and recent trades (also catches up on anything missed while the app was closed). */
+  async refreshWallet(address, { initial = false } = {}) {
+    const w = this.wallets.find((x) => x.address === address);
+    if (!w || !this.rpc || w.loading) return;
+    w.loading = true;
+    this._emit();
+    try {
+      const bal = await this.rpc.call('getBalance', [address, { commitment: 'confirmed' }]).catch(() => null);
+      if (bal) w.balance = BigInt(bal.value);
+      const sigs = await this.rpc.call('getSignaturesForAddress', [address, { limit: 20, commitment: 'confirmed' }]);
+      const fresh = (sigs || []).filter((x) => !x.err && !w.seen.has(x.signature)).slice(0, 15).reverse();
+      for (const x of fresh) {
+        if (!this.wallets.includes(w)) return;
+        const tx = await this.rpc.call('getTransaction', [x.signature, { encoding: 'json', commitment: 'confirmed', maxSupportedTransactionVersion: 1 }]).catch(() => null);
+        w.seen.add(x.signature);
+        if (!tx?.meta || tx.meta.err) continue;
+        const trades = walletTradesFromLogs(tx.meta.logMessages, address);
+        if (!trades.length) continue;
+        const at = x.blockTime ? x.blockTime * 1000 : this.now();
+        // copy buys only if they're fresh; copy sells always (so you're never left holding)
+        this._walletTrades(w, x.signature, trades, at, { copyBuys: !initial && this.now() - at < 30_000, copySells: !initial });
+      }
+      w.lastCheckedAt = this.now();
+    } finally {
+      w.loading = false;
+      this._saveWallets();
+      this._emit();
+    }
+  }
+
+  _onWalletLogs(address, sig, logs) {
+    const w = this.wallets.find((x) => x.address === address);
+    if (!w || w.seen.has(sig)) return;
+    const trades = walletTradesFromLogs(logs, address);
+    w.seen.add(sig);
+    if (!trades.length) return;
+    this._walletTrades(w, sig, trades, this.now(), { copyBuys: true, copySells: true });
+    this._saveWallets();
+    this._emit();
+  }
+
+  _walletTrades(w, sig, trades, at, { copyBuys, copySells }) {
+    for (const ev of trades) {
+      const before = BigInt(w.holdings[ev.mint] || 0n);
+      w.holdings[ev.mint] = ev.isBuy ? before + ev.tokenAmount : before > ev.tokenAmount ? before - ev.tokenAmount : 0n;
+      if (!ev.isBuy && w.holdings[ev.mint] === 0n) delete w.holdings[ev.mint];
+      const meta = this._meta(ev.mint);
+      const entry = { sig, mint: ev.mint, buy: ev.isBuy, sol: Number(ev.solAmount) / 1e9, t: at, symbol: meta?.symbol || null, name: meta?.name || null, note: null };
+      w.trades.unshift(entry);
+      if (w.trades.length > 40) w.trades.length = 40;
+      w.lastTradeAt = Math.max(w.lastTradeAt || 0, at);
+      if (ev.isBuy && copyBuys && w.copy) this._copyBuy(w, ev, entry).catch(() => {});
+      if (!ev.isBuy && copySells) this._copySell(w, ev, before, entry);
+    }
+  }
+
+  /** Name and symbol of a coin for the tracker (looked up once, in the background). */
+  _meta(mint) {
+    const c = this.coins.get(mint);
+    if (c) return { name: c.name, symbol: c.symbol };
+    const hit = this.metaCache.get(mint);
+    if (hit !== undefined) return hit;
+    this.metaCache.set(mint, null);
+    if (this.metaCache.size > 500) this.metaCache.delete(this.metaCache.keys().next().value);
+    if (this.rpc) {
+      this._readCoin(mint).then((st) => {
+        const m = st.meta ? { name: st.meta.name, symbol: st.meta.symbol } : null;
+        this.metaCache.set(mint, m);
+        if (m) for (const w of this.wallets) for (const t of w.trades) if (t.mint === mint && !t.symbol) { t.symbol = m.symbol; t.name = m.name; }
+        this._emit();
+      }).catch(() => {});
+    }
+    return null;
+  }
+
+  async _copyBuy(w, ev, entry) {
+    const mode = this.settings.mode;
+    const id = mode + ':' + ev.mint;
+    const who = this.walletLabel(w.address);
+    const skip = (why) => { entry.note = 'Not copied: ' + why; this.log('skip', `Didn't copy ${who}'s buy of ${entry.symbol || short(ev.mint)}: ${why}.`, { mint: ev.mint }); };
+    if (!this.running) return skip('the bot is stopped');
+    if (!this.wallet || !this.rpc) return skip('finish setup first');
+    if (this.positions.has(id) || this.buying.has(ev.mint)) return skip('you already hold it');
+    if (ev.solPaired === false) return skip("it isn't a SOL coin");
+    if (Number(ev.solAmount) / 1e9 < w.minLeaderSol) return skip('their buy was tiny');
+    const rules = this.rules();
+    if (-pump.lamportsToSol(this.daily[mode] || 0n) >= rules.dailyLossSol) return skip("today's loss limit is reached");
+    if (this._openPositions(mode).filter((p) => p.copiedFrom).length >= MAX_COPY_OPEN) return skip(`${MAX_COPY_OPEN} copied trades are already open`);
+    const need = pump.solToLamports(w.copySol + (mode === 'real' ? rules.keepSolReserve + FEE_BUFFER_SOL : 0.001));
+    if (this.availableLamports(mode) < need) return skip('not enough SOL');
+    this.buying.add(ev.mint); // claim it before anything async
+    entry.note = 'Copying…';
+    this._emit();
+    try {
+      const st = await this._readCoin(ev.mint).catch(() => null);
+      if (!st?.curve) return skip("couldn't read the coin");
+      if (st.curve.complete) return skip('it already graduated');
+      // don't chase: skip if the price ran far past what they paid
+      const theirs = Number(ev.virtualSolReserves) / Number(ev.virtualTokenReserves);
+      const now = Number(st.curve.virtualQuoteReserves) / Number(st.curve.virtualTokenReserves);
+      if (theirs > 0 && now > theirs * 1.25) return skip(`the price is already up ${Math.round((now / theirs - 1) * 100)}% since they bought`);
+      this.buying.delete(ev.mint);
+      const p = await this._buy(ev.mint, w.copySol, 'copy', { copiedFrom: w.address, mayhem: !!st.curve.isMayhemMode, creator: st.curve.creator });
+      entry.note = 'Copied';
+      // they already sold everything while our buy was landing: don't get left holding it
+      if (p && !(BigInt(w.holdings[ev.mint] || 0n) > 0n) && this.positions.get(p.id) === p) {
+        p.sellRequested = `${who} already sold`;
+        p.nextSellAt = 0;
+        this._sell(p, p.sellRequested);
+      }
+    } catch (e) {
+      entry.note = 'Copy failed: ' + (e.message || 'error');
+    } finally {
+      this.buying.delete(ev.mint);
+      this._saveWallets();
+      this._emit();
+    }
+  }
+
+  _copySell(w, ev, theirBefore, entry) {
+    for (const p of this.positions.values()) {
+      if (p.mint !== ev.mint || p.copiedFrom !== w.address) continue;
+      const fraction = theirBefore > 0n ? Number(ev.tokenAmount) / Number(theirBefore) : 1;
+      const who = this.walletLabel(w.address);
+      entry.note = 'Copied the sell';
+      if (fraction >= 0.9) {
+        p.sellRequested = `${who} sold`;
+        p.nextSellAt = 0;
+        if (p.state !== 'selling') this._sell(p, p.sellRequested);
+      } else if (p.state !== 'selling') {
+        this._sellPart(p, fraction, `${who} sold ${Math.round(fraction * 100)}%`);
+      }
+      this._ensureLoop();
+    }
+  }
+
   // ---------- numbers for the screen ----------
 
   stats(mode = this.settings.mode) {
-    const list = this.history.filter((h) => h.mode === mode && h.pnlLamports !== null && !h.found);
+    const all = this.history.filter((h) => h.mode === mode && h.pnlLamports !== null && !h.found);
+    const list = all.filter((h) => !h.partial);
     const wins = list.filter((h) => h.pnlLamports > 0n).length;
-    const total = list.reduce((s, h) => s + BigInt(h.pnlLamports), 0n);
+    const total = all.reduce((s, h) => s + BigInt(h.pnlLamports), 0n);
     this._rollDay();
     return { trades: list.length, wins, losses: list.length - wins, totalLamports: total, todayLamports: this.daily[mode] || 0n };
+  }
+
+  /** What the bot is thinking, for the screen. */
+  brain() {
+    const coins = [...this.coins.values()];
+    const studying = coins.filter((c) => c.stage === 'study').sort((a, b) => (b.verdict?.score || 0) - (a.verdict?.score || 0));
+    const passed = coins.filter((c) => c.stage === 'passed');
+    return { studying, passed, pipeline: this.pipeline, pickiness: this.pickiness(), lossStreak: this.lossStreak?.[this.settings.mode] || 0 };
   }
 
   openValue(mode = this.settings.mode) {

@@ -102,6 +102,34 @@ export function encodePool(p) {
 
 function decodeCurveFull(data) { return pump.decodeBondingCurve(data); }
 
+const i64le = (v) => { const b = new Uint8Array(8); new DataView(b.buffer).setBigInt64(0, BigInt(v), true); return b; };
+const bstr = (s) => { const b = new TextEncoder().encode(s); return concat(u32le(b.length), b); };
+const ZERO = new Uint8Array(32);
+
+/** A pump.fun TradeEvent, byte for byte as in idl/pump.json. */
+export function encodeTradeEvent(e) {
+  return concat(
+    Uint8Array.from([189, 219, 127, 211, 78, 230, 97, 238]),
+    b58decode(e.mint), u64le(BigInt(e.solAmount)), u64le(BigInt(e.tokenAmount)), Uint8Array.of(e.isBuy ? 1 : 0),
+    b58decode(e.user), i64le(e.timestamp ?? 1_800_000_000),
+    u64le(BigInt(e.virtualSolReserves)), u64le(BigInt(e.virtualTokenReserves)), u64le(BigInt(e.realSolReserves)), u64le(BigInt(e.realTokenReserves)),
+    b58decode(pump.BUYBACK_FEE_RECIPIENTS[0]), u64le(95n), u64le(1000n), b58decode(e.creator || SYSTEM), u64le(30n), u64le(300n),
+    Uint8Array.of(1), u64le(0n), u64le(0n), u64le(0n), i64le(0),
+    bstr(e.isBuy ? 'buy_exact_quote_in_v3' : 'sell_v3'), Uint8Array.of(e.mayhem ? 1 : 0),
+    u64le(0n), u64le(0n), u64le(0n), u64le(0n),
+    u32le(0), e.quoteMint ? b58decode(e.quoteMint) : ZERO, u64le(BigInt(e.solAmount)), u64le(BigInt(e.virtualSolReserves)), u64le(BigInt(e.realSolReserves)),
+    u64le(0n), u64le(0n), u64le(0n),
+  );
+}
+
+/** Transaction logs that carry pump.fun events, emitted the way the program emits them. */
+export function pumpLogs(events, { program = pump.PUMP } = {}) {
+  const lines = [`Program ${program} invoke [1]`, 'Program log: Instruction: Trade'];
+  for (const e of events) lines.push('Program data: ' + toBase64(e instanceof Uint8Array ? e : encodeTradeEvent(e)));
+  lines.push(`Program ${program} success`);
+  return lines;
+}
+
 export class MockChain {
   constructor(opts = {}) {
     this.accounts = new Map();
@@ -166,6 +194,44 @@ export class MockChain {
     this.set(baseTa, { lamports: RENT[tokenProgram], owner: tokenProgram, data: encodeTokenAccount(mint, pool, base) });
     this.set(quoteTa, { lamports: RENT[pump.TOKEN] + quote, owner: pump.TOKEN, data: encodeTokenAccount(pump.WSOL, pool, quote) });
     return pool;
+  }
+
+  /**
+   * Someone else trades a coin on its curve. Updates the curve, the curve's
+   * token account and the trader's token account, and returns the TradeEvent
+   * the program would emit (send it to subscribers with pumpLogs()).
+   */
+  async trade(mint, { user = b58encode(nodeCrypto.randomBytes(32)), sol = null, tokens = null, isBuy = true, tokenProgram = pump.TOKEN_2022 } = {}) {
+    const curveAddr = await pump.bondingCurveAddress(mint);
+    const curveAta = await associatedTokenAddress(curveAddr, mint, tokenProgram);
+    const c = decodeCurveFull(this.get(curveAddr).data);
+    const userAta = await associatedTokenAddress(user, mint, tokenProgram);
+    const held = this.get(userAta) ? pump.decodeTokenAccount(this.get(userAta).data).amount : 0n;
+    let solAmount, tokenAmount, next;
+    if (isBuy) {
+      const net = BigInt(Math.round(sol * 1e9));
+      tokenAmount = (net * c.virtualTokenReserves) / (c.virtualQuoteReserves + net);
+      if (tokenAmount > c.realTokenReserves) tokenAmount = c.realTokenReserves;
+      solAmount = net;
+      next = { ...c, virtualQuoteReserves: c.virtualQuoteReserves + net, realQuoteReserves: c.realQuoteReserves + net, virtualTokenReserves: c.virtualTokenReserves - tokenAmount, realTokenReserves: c.realTokenReserves - tokenAmount };
+      this.get(curveAddr).lamports += net;
+    } else {
+      tokenAmount = tokens === null ? held : BigInt(tokens);
+      if (tokenAmount > held) tokenAmount = held;
+      solAmount = (tokenAmount * c.virtualQuoteReserves) / (c.virtualTokenReserves + tokenAmount);
+      next = { ...c, virtualQuoteReserves: c.virtualQuoteReserves - solAmount, realQuoteReserves: c.realQuoteReserves - solAmount, virtualTokenReserves: c.virtualTokenReserves + tokenAmount, realTokenReserves: c.realTokenReserves + tokenAmount };
+      this.get(curveAddr).lamports -= solAmount;
+    }
+    this.get(curveAddr).data = encodeCurve(next);
+    const ataAcc = this.get(curveAta);
+    const curveHeld = pump.decodeTokenAccount(ataAcc.data).amount;
+    ataAcc.data = encodeTokenAccount(mint, curveAddr, isBuy ? curveHeld - tokenAmount : curveHeld + tokenAmount);
+    this.set(userAta, { lamports: RENT[tokenProgram], owner: tokenProgram, data: encodeTokenAccount(mint, user, isBuy ? held + tokenAmount : held - tokenAmount) });
+    return {
+      mint, user, isBuy, solAmount, tokenAmount, creator: next.creator, mayhem: next.isMayhemMode,
+      virtualSolReserves: next.virtualQuoteReserves, virtualTokenReserves: next.virtualTokenReserves,
+      realSolReserves: next.realQuoteReserves, realTokenReserves: next.realTokenReserves,
+    };
   }
 
   async giveTokens(owner, mint, amount, tokenProgram = pump.TOKEN_2022) {

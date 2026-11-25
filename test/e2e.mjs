@@ -5,7 +5,7 @@ import { chromium } from 'playwright';
 import fs from 'node:fs';
 import path from 'node:path';
 import nodeCrypto from 'node:crypto';
-import { MockChain, encodeTokenAccount } from './mockchain.mjs';
+import { MockChain, encodeTokenAccount, encodeTradeEvent, pumpLogs } from './mockchain.mjs';
 import { b58decode, b58encode } from '../js/b58.js';
 import { concat, toBase64, u32le, u64le } from '../js/bytes.js';
 import * as pump from '../js/pump.js';
@@ -23,51 +23,65 @@ const chain = new MockChain();
 const errors = [];
 
 function bstr(s) { const b = new TextEncoder().encode(s); return concat(u32le(b.length), b); }
-async function createLogs(mint, name, symbol) {
-  const curve = await pump.bondingCurveAddress(mint);
-  const creator = b58encode(nodeCrypto.randomBytes(32));
-  const ev = concat(Uint8Array.from([27, 114, 169, 77, 222, 235, 99, 118]), bstr(name), bstr(symbol), bstr('https://x'),
-    b58decode(mint), b58decode(curve), b58decode(creator), b58decode(creator), u64le(1n), u64le(1n), u64le(1n), u64le(1n), u64le(1n), b58decode(pump.TOKEN_2022), Uint8Array.of(0, 0));
-  return [`Program ${pump.PUMP} invoke [1]`, 'Program log: Instruction: CreateV2', `Program data: ${toBase64(ev)}`, `Program ${pump.PUMP} success`];
+function createEvent(mint, curve, creator, name, symbol, mayhem) {
+  return concat(Uint8Array.from([27, 114, 169, 77, 222, 235, 99, 118]), bstr(name), bstr(symbol), bstr('https://x'),
+    b58decode(mint), b58decode(curve), b58decode(creator), b58decode(creator), u64le(1n),
+    u64le(pump.INITIAL_VIRTUAL_TOKEN_RESERVES), u64le(pump.INITIAL_VIRTUAL_SOL_RESERVES), u64le(pump.INITIAL_REAL_TOKEN_RESERVES), u64le(10n ** 15n),
+    b58decode(pump.TOKEN_2022), Uint8Array.of(mayhem ? 1 : 0, 0));
 }
 
-const coins = new Map(); // mint -> { name, symbol, trend }
-async function launch(name, symbol, trend) {
+// live sockets: every logsSubscribe gets its own id; trades go to whoever watches that address
+const subsByAddr = new Map();
+let nextSub = 100;
+function notify(address, logs) {
+  for (const { ws, id } of subsByAddr.get(address) || []) {
+    try { ws.send(JSON.stringify({ jsonrpc: '2.0', method: 'logsNotification', params: { subscription: id, result: { context: { slot: 1 }, value: { signature: b58encode(nodeCrypto.randomBytes(64)), err: null, logs } } } })); } catch {}
+  }
+}
+
+const coins = new Map(); // mint -> { name, symbol, trend, curveAddr, creator, born }
+let agentAddr = null;
+async function launch(name, symbol, trend, { mayhem = false, devBuy = 0 } = {}) {
   const mint = b58encode(nodeCrypto.randomBytes(32));
-  const { curveAddr, curveAta } = await chain.addCoin({ mint });
-  coins.set(mint, { name, symbol, trend, curveAddr, curveAta, born: Date.now() });
+  const { curveAddr, curveAta, creator } = await chain.addCoin({ mint, curve: { isMayhemMode: mayhem } });
+  const k = { name, symbol, trend, curveAddr, curveAta, creator, mayhem, born: Date.now(), devBuy };
+  coins.set(mint, k);
+  if (devBuy) k.devEvent = await chain.trade(mint, { user: creator, sol: devBuy });
   return mint;
 }
-async function othersBuy(mint, sol) {
+async function trade(mint, opts) {
   const k = coins.get(mint);
   const c = pump.decodeBondingCurve(chain.get(k.curveAddr).data);
-  const net = BigInt(Math.round(sol * 1e9));
-  const out = (net * c.virtualTokenReserves) / (c.virtualQuoteReserves + net);
-  if (out <= 0n || out >= c.realTokenReserves) return;
-  await chain.setCurve(mint, { virtualQuoteReserves: c.virtualQuoteReserves + net, realQuoteReserves: c.realQuoteReserves + net, virtualTokenReserves: c.virtualTokenReserves - out, realTokenReserves: c.realTokenReserves - out });
-  chain.get(k.curveAddr).lamports += net;
-  const ataAcc = chain.get(k.curveAta);
-  ataAcc.data = encodeTokenAccount(mint, k.curveAddr, pump.decodeTokenAccount(ataAcc.data).amount - out);
-  await chain.giveTokens(b58encode(nodeCrypto.randomBytes(32)), mint, out);
+  if (c.complete || (opts.isBuy !== false && c.realTokenReserves < 50_000_000_000_000n)) return null;
+  const ev = await chain.trade(mint, opts);
+  notify(k.curveAddr, pumpLogs([ev]));
+  if (opts.user) notify(opts.user, pumpLogs([ev]));
+  return ev;
 }
-async function othersSell(mint, fraction) {
-  const k = coins.get(mint);
-  const c = pump.decodeBondingCurve(chain.get(k.curveAddr).data);
-  const q = BigInt(Math.round(Number(c.virtualQuoteReserves) * (1 - fraction)));
-  const newT = (c.virtualQuoteReserves * c.virtualTokenReserves) / q;
-  await chain.setCurve(mint, { virtualQuoteReserves: q, virtualTokenReserves: newT, realTokenReserves: c.realTokenReserves + (newT - c.virtualTokenReserves) });
-}
+const othersBuy = (mint, sol, user) => trade(mint, { sol, user });
 
 let market = null;
 function startMarket() {
+  let busy = false;
   market = setInterval(async () => {
-    for (const [mint, k] of coins) {
-      const age = (Date.now() - k.born) / 1000;
-      if (k.trend === 'moon') await othersBuy(mint, age < 12 ? 0.5 : 0.7);
-      else if (k.trend === 'flat') { if (Math.random() < 0.3) await othersBuy(mint, 0.05); }
-      else if (k.trend === 'rug') { if (age < 40) await othersBuy(mint, 0.6); else if (!k.rugged) { k.rugged = true; await othersSell(mint, 0.6); } }
-      else if (k.trend === 'pump-hard') await othersBuy(mint, 1.8);
-    }
+    if (busy) return;
+    busy = true;
+    try {
+      for (const [mint, k] of coins) {
+        const age = (Date.now() - k.born) / 1000;
+        if (k.trend === 'moon') { await othersBuy(mint, 0.2 + Math.random() * 0.25); await othersBuy(mint, 0.15 + Math.random() * 0.2); }
+        else if (k.trend === 'flat') { if (Math.random() < 0.3) await othersBuy(mint, 0.05); }
+        else if (k.trend === 'rug') {
+          if (age < 22) await othersBuy(mint, 0.35);
+          else if (!k.rugged) { k.rugged = true; await trade(mint, { user: k.creator, isBuy: false }); }
+          else if (Math.random() < 0.5) await othersBuy(mint, 0.05);
+        } else if (k.trend === 'agent') {
+          await trade(mint, { user: agentAddr, sol: 0.3 });
+          if (Math.random() < 0.5) await trade(mint, { user: agentAddr, isBuy: false, tokens: 6_000_000_000_000n });
+          if (age < 6) await othersBuy(mint, 0.4);
+        }
+      }
+    } finally { busy = false; }
   }, 1000);
 }
 
@@ -76,7 +90,7 @@ async function main() {
   const context = await browser.newContext({
     viewport: { width: 440, height: 956 }, deviceScaleFactor: 3, isMobile: true, hasTouch: true,
     userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.1 Mobile/15E148 Safari/604.1',
-    colorScheme: 'dark',
+    colorScheme: 'light',
   });
   await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: ORIGIN });
   const page = await context.newPage();
@@ -109,17 +123,30 @@ async function main() {
     sockets.chain.push(ws);
     ws.onMessage((m) => {
       const j = JSON.parse(m);
-      if (j.method === 'logsSubscribe') ws.send(JSON.stringify({ jsonrpc: '2.0', id: j.id, result: 99 }));
+      if (j.method === 'logsSubscribe') {
+        const id = nextSub++;
+        const a = j.params[0].mentions[0];
+        if (!subsByAddr.has(a)) subsByAddr.set(a, []);
+        subsByAddr.get(a).push({ ws, id });
+        ws.send(JSON.stringify({ jsonrpc: '2.0', id: j.id, result: id }));
+      } else if (j.method === 'logsUnsubscribe') {
+        for (const [a, list] of subsByAddr) subsByAddr.set(a, list.filter((x) => !(x.ws === ws && x.id === j.params[0])));
+        ws.send(JSON.stringify({ jsonrpc: '2.0', id: j.id, result: true }));
+      }
     });
   });
   await page.routeWebSocket('wss://pumpportal.fun/api/data', (ws) => {
     sockets.portal.push(ws);
     ws.onMessage((m) => { if (JSON.parse(m).method === 'subscribeNewToken') ws.send(JSON.stringify({ message: 'Successfully subscribed to token creation events.' })); });
   });
+  const MINT_AUTH = await pump.mintAuthorityAddress();
+  agentAddr = await pump.mayhemAgentAddress();
   const announce = async (mint) => {
     const k = coins.get(mint);
-    for (const ws of sockets.chain) ws.send(JSON.stringify({ jsonrpc: '2.0', method: 'logsNotification', params: { subscription: 99, result: { context: { slot: 1 }, value: { signature: b58encode(nodeCrypto.randomBytes(64)), err: null, logs: await createLogs(mint, k.name, k.symbol) } } } }));
-    for (const ws of sockets.portal) ws.send(JSON.stringify({ signature: 'x', mint, traderPublicKey: b58encode(nodeCrypto.randomBytes(32)), txType: 'create', name: k.name, symbol: k.symbol, pool: 'pump' }));
+    const events = [createEvent(mint, k.curveAddr, k.creator, k.name, k.symbol, k.mayhem)];
+    if (k.devEvent) events.push(encodeTradeEvent(k.devEvent));
+    notify(MINT_AUTH, pumpLogs(events));
+    for (const ws of sockets.portal) ws.send(JSON.stringify({ signature: 'x', mint, traderPublicKey: k.creator, txType: 'create', name: k.name, symbol: k.symbol, pool: 'pump' }));
   };
 
   const shot = async (name) => { await sleep(350); await page.screenshot({ path: path.join(SHOTS, name + '.png') }); log('shot', name); };
@@ -170,29 +197,75 @@ async function main() {
   const whale = await launch('Whale Coin', 'WHALE', 'moon');
   await chain.giveTokens(b58encode(nodeCrypto.randomBytes(32)), whale, 200_000_000_000_000n);
   await announce(whale);
-  await sleep(6000);
+  const rug = await launch('Mangy Wad', 'MANGY', 'rug', { devBuy: 1.5 });
+  await announce(rug);
+  const agentCoin = await launch('Agent Only', 'AGNT', 'agent', { mayhem: true });
+  await announce(agentCoin);
+  await sleep(16000);
+  await shot('09-home-studying');
   await tap('[data-action="tab"][data-tab="coins"]');
-  await shot('09-coins-live');
-  await tap('[data-action="tab"][data-tab="home"]');
-  log('waiting for the practice buy…');
-  await page.waitForFunction(() => document.querySelectorAll('[data-action="pos"]').length > 0, null, { timeout: 90_000 });
-  await shot('10-home-practice-holding');
-  await tap('[data-action="tab"][data-tab="trades"]');
-  await shot('11-trades-open');
-  log('waiting for take profit…');
-  await page.waitForFunction(() => !document.querySelector('.pos'), null, { timeout: 120_000 });
-  await tap('[data-action="trades-view"][data-view="history"]');
-  await shot('12-trades-history');
-  await tap('[data-action="tab"][data-tab="coins"]');
-  await tap(`[data-action="coin"][data-mint="${whale}"]`);
-  await shot('13-coin-sheet-whale');
+  await shot('10-coins-studying');
+  await tap(`[data-action="coin"][data-mint="${moon}"]`);
+  await sleep(600);
+  await shot('11-coin-sheet-studying');
   await tap('.sheet [data-action="close-sheet"]');
+  await tap('[data-action="tab"][data-tab="home"]');
+  log('waiting for the practice buy (after a 45 s study)…');
+  await page.waitForFunction(() => document.querySelectorAll('[data-action="pos"]').length > 0, null, { timeout: 120_000 });
+  await shot('12-home-practice-holding');
+  await tap('[data-action="tab"][data-tab="trades"]');
+  await shot('13-trades-open');
+  log('waiting for take profit…');
+  await page.waitForFunction(() => !document.querySelector('.pos'), null, { timeout: 150_000 });
+  await tap('[data-action="trades-view"][data-view="history"]');
+  await shot('14-trades-history');
+  await tap('[data-action="tab"][data-tab="coins"]');
+  await shot('15-coins-studied');
+  await tap(`[data-action="coin"][data-mint="${rug}"]`);
+  await sleep(500);
+  await shot('16-coin-sheet-mangy');
+  const rugSheet = await page.locator('.sheet').textContent();
+  log('MANGY verdict:', /Creator is selling/.test(rugSheet) ? 'rejected: creator is selling' : 'UNEXPECTED: ' + rugSheet.slice(0, 300));
+  if (!/Creator is selling/.test(rugSheet)) errors.push('MANGY coin was not rejected for the creator selling');
+  await tap('.sheet [data-action="close-sheet"]');
+  await tap(`[data-action="coin"][data-mint="${whale}"]`);
+  await sleep(500);
+  await shot('17-coin-sheet-whale');
+  await tap('.sheet [data-action="close-sheet"]');
+
+  // ---------- wallet tracker & copy trading (practice) ----------
+  const leader = b58encode(nodeCrypto.randomBytes(32));
+  await tap('[data-action="tab"][data-tab="wallets"]');
+  await shot('18-wallets-empty');
+  await page.fill('#track-input', 'https://pump.fun/profile/' + leader);
+  await tap('[data-action="track"]');
+  await page.waitForSelector('.wallet');
+  await tap(`[data-wallet-copy="${leader}"]`);
+  await tap('[data-dlg="yes"]');
+  await page.waitForSelector('.copybox.on');
+  const copyCoin = await launch('Copy Cat', 'COPY', 'flat');
+  await announce(copyCoin);
+  await sleep(1500);
+  await othersBuy(copyCoin, 0.8);
+  const leaderBuy = await trade(copyCoin, { user: leader, sol: 1.2 });
+  log('leader bought', leaderBuy ? 'ok' : 'failed');
+  await page.waitForFunction(() => [...document.querySelectorAll('.wtrade .note')].some((n) => /Copied/.test(n.textContent)), null, { timeout: 20_000 });
+  await shot('19-wallets-copied');
+  await tap('[data-action="tab"][data-tab="trades"]');
+  await tap('[data-action="trades-view"][data-view="open"]');
+  await shot('20-trades-copy-open');
+  await trade(copyCoin, { user: leader, isBuy: false });
+  await page.waitForFunction(() => !document.querySelector('.pos .badge.copy'), null, { timeout: 20_000 });
+  log('copied trade closed after the leader sold');
+  await tap('[data-action="tab"][data-tab="wallets"]');
+  await tap(`[data-wallet-copy="${leader}"]`); // copying off again
+  await sleep(300);
 
   // ---------- real money ----------
   await tap('[data-action="tab"][data-tab="home"]');
   await tap('[data-action="power"]'); // stop
   await tap('[data-action="mode-sheet"]');
-  await shot('14-mode-sheet');
+  await shot('21-mode-sheet');
   await tap('[data-action="set-mode"][data-mode="real"]');
   await tap('[data-dlg="yes"]');
   // fund the bot wallet from "Phantom", using the address shown in the app
@@ -201,7 +274,7 @@ async function main() {
   log('bot wallet address from the app:', pubkey);
   chain.addWallet(pubkey, 0.5);
   await sleep(1500);
-  await shot('15-deposit-sheet');
+  await shot('22-deposit-sheet');
   await tap('.sheet [data-action="close-sheet"]');
   await page.evaluate(() => window.dispatchEvent(new Event('online')));
   await sleep(1500);
@@ -210,9 +283,9 @@ async function main() {
   await page.waitForFunction(() => document.querySelector('.power.on'), null, { timeout: 10_000 });
   const moon2 = await launch('Laser Frog', 'LFROG', 'moon');
   await announce(moon2);
-  log('waiting for the real buy…');
-  await page.waitForFunction(() => document.querySelectorAll('[data-action="pos"]').length > 0, null, { timeout: 90_000 });
-  await shot('16-home-real-holding');
+  log('waiting for the real buy (after a 45 s study)…');
+  await page.waitForFunction(() => document.querySelectorAll('[data-action="pos"]').length > 0, null, { timeout: 120_000 });
+  await shot('23-home-real-holding');
   const { associatedTokenAddress } = await import('../js/pda.js');
   const held = [];
   for (const [mint, k] of coins) { const amt = chain.tokenAmount(await associatedTokenAddress(pubkey, mint, pump.TOKEN_2022)); if (amt > 0n) held.push(k.symbol + '=' + amt); }
@@ -220,33 +293,35 @@ async function main() {
   const ata = await associatedTokenAddress(pubkey, [...coins.keys()].find((m) => held.some((h) => h.startsWith(coins.get(m).symbol + '='))) || moon2, pump.TOKEN_2022);
   await tap('[data-action="tab"][data-tab="trades"]');
   await tap('[data-action="trades-view"][data-view="open"]');
-  await shot('17-trades-real-open');
+  await shot('24-trades-real-open');
   // sell by hand
   await tap('[data-action="sell"]');
   await tap('[data-dlg="yes"]');
   await page.waitForFunction(() => !document.querySelector('.pos'), null, { timeout: 30_000 });
   log('tokens on chain after sell:', chain.tokenAmount(ata).toString(), 'sol:', Number(chain.lamports(pubkey)) / 1e9);
   await tap('[data-action="trades-view"][data-view="history"]');
-  await shot('18-trades-real-history');
+  await shot('25-trades-real-history');
   await tap('[data-action="tab"][data-tab="home"]');
-  await shot('19-home-real');
+  await shot('26-home-real');
   // withdraw
   await tap('[data-action="tab"][data-tab="settings"]');
   await tap('[data-action="withdraw"]');
   const phantom = b58encode(nodeCrypto.randomBytes(32));
   await page.fill('#wd-to', phantom);
   await tap('[data-action="wd-max"]');
-  await shot('20-withdraw');
+  await shot('27-withdraw');
   await tap('[data-action="wd-go"]');
   await tap('[data-dlg="yes"]');
   await sleep(2500);
   log('phantom received SOL:', Number(chain.lamports(phantom)) / 1e9);
   await tap('[data-action="tab"][data-tab="home"]');
   await tap('[data-action="power"]');
-  await shot('21-home-after-withdraw');
+  await shot('28-home-after-withdraw');
   await tap('[data-action="tab"][data-tab="settings"]');
+  await page.evaluate(() => window.scrollTo(0, 700));
+  await shot('29-settings-study');
   await tap('[data-action="help"]');
-  await shot('22-help');
+  await shot('30-help');
 
   clearInterval(market);
   await browser.close();

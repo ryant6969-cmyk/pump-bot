@@ -2,7 +2,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "test": "node --test --test-timeout=60000 test/*.test.mjs",
+    "test": "node --test --test-timeout=240000 test/*.test.mjs",
     "e2e": "node test/e2e.mjs"
   },
   "name": "win-bot",

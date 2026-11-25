@@ -56,7 +56,7 @@ test('both sources feed coins; duplicates are dropped; dead sockets reconnect', 
   FakeWS.all = [];
   const coins = [];
   const statuses = [];
-  const feed = new CoinFeed({ wsUrl: 'wss://rpc.test/?api-key=k', WebSocketImpl: FakeWS, onCoin: (c) => coins.push(c), onStatus: (s) => statuses.push({ ...s }) });
+  const feed = new CoinFeed({ wsUrl: 'wss://rpc.test/?api-key=k', WebSocketImpl: FakeWS, onCoin: (c) => { if (!c.update) coins.push(c); }, onStatus: (s) => statuses.push({ ...s }) });
   await feed.start();
   const chainWs = FakeWS.all.find((w) => w.url.startsWith('wss://rpc.test'));
   const portalWs = FakeWS.all.find((w) => w.url === 'wss://pumpportal.fun/api/data');
@@ -96,4 +96,35 @@ test('both sources feed coins; duplicates are dropped; dead sockets reconnect', 
   const n = FakeWS.all.length;
   t.mock.timers.tick(120_000);
   assert.equal(FakeWS.all.length, n, 'no reconnects after stop');
+});
+
+test('a refused subscription is retried on its own; the connection and other subscriptions stay up', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] });
+  FakeWS.all = [];
+  const { ChainStream } = await import('../js/rpc.js');
+  const stream = new ChainStream('wss://rpc.test/', { WebSocketImpl: FakeWS });
+  const got = [];
+  stream.subscribe('AddrA', (sig) => got.push('A:' + sig));
+  stream.subscribe('AddrB', (sig) => got.push('B:' + sig));
+  stream.start();
+  const ws = FakeWS.all[0];
+  ws.open();
+  assert.equal(ws.sent.length, 2);
+  ws.msg({ jsonrpc: '2.0', id: ws.sent[0].id, result: 11 });
+  ws.msg({ jsonrpc: '2.0', id: ws.sent[1].id, error: { code: -32000, message: 'too many' } });
+  assert.equal(ws.closed, false, 'socket stays open');
+  assert.equal(stream.status, 'live');
+  ws.msg({ jsonrpc: '2.0', method: 'logsNotification', params: { subscription: 11, result: { value: { signature: 's1', err: null, logs: [] } } } });
+  t.mock.timers.tick(5100);
+  assert.equal(ws.sent.length, 3, 'retried B');
+  assert.deepEqual(ws.sent[2].params[0], { mentions: ['AddrB'] });
+  ws.msg({ jsonrpc: '2.0', id: ws.sent[2].id, result: 12 });
+  ws.msg({ jsonrpc: '2.0', method: 'logsNotification', params: { subscription: 12, result: { value: { signature: 's2', err: null, logs: [] } } } });
+  assert.deepEqual(got, ['A:s1', 'B:s2']);
+  // unsubscribing sends logsUnsubscribe and stops delivery
+  stream.unsubscribe('AddrA');
+  assert.equal(ws.sent[3].method, 'logsUnsubscribe');
+  ws.msg({ jsonrpc: '2.0', method: 'logsNotification', params: { subscription: 11, result: { value: { signature: 's3', err: null, logs: [] } } } });
+  assert.deepEqual(got, ['A:s1', 'B:s2']);
+  stream.stop();
 });

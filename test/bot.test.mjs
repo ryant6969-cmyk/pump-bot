@@ -1,5 +1,5 @@
 // The whole bot against the fake network: a coin launches, other people buy
-// it, the bot checks it, buys, and sells by its rules. Practice and Real.
+// it, the bot studies it, buys, and sells by its rules. Practice and Real.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import nodeCrypto from 'node:crypto';
@@ -10,68 +10,8 @@ import { Keypair } from '../js/keys.js';
 import { Store } from '../js/store.js';
 import { associatedTokenAddress } from '../js/pda.js';
 import * as pump from '../js/pump.js';
-import { MockChain, encodeTokenAccount } from './mockchain.mjs';
-
-const FAST = { pollMs: 10, resendMs: 40, heightCheckMs: 40, giveUpMs: 3000, detailsRetryMs: 10, botPollMs: 999999 };
-class SilentWS { constructor() {} send() {} close() {} }
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const bots = [];
-test.afterEach(() => { while (bots.length) bots.pop().dispose(); });
-
-class MemStorage {
-  constructor() { this.m = new Map(); }
-  get length() { return this.m.size; }
-  key(i) { return [...this.m.keys()][i] ?? null; }
-  getItem(k) { return this.m.has(k) ? this.m.get(k) : null; }
-  setItem(k, v) { this.m.set(k, String(v)); }
-  removeItem(k) { this.m.delete(k); }
-}
-
-async function setup({ mode = 'practice', sol = 1, style = 'balanced' } = {}) {
-  const chain = new MockChain();
-  const clock = { t: 1_800_000_000_000 };
-  const storage = new MemStorage();
-  const bot = new Bot({ store: new Store(storage), fetchImpl: chain.fetchImpl, WebSocketImpl: SilentWS, now: () => clock.t, timing: FAST });
-  bots.push(bot);
-  await bot.init();
-  bot.updateSettings({ rpcInput: 'https://rpc.test/', style, mode, setupDone: true });
-  await bot.createWallet();
-  chain.addWallet(bot.wallet.address, sol);
-  await bot.refreshBalance();
-  const mint = b58encode(nodeCrypto.randomBytes(32));
-  const { curveAddr, curveAta } = await chain.addCoin({ mint });
-  // other traders buying (each a different wallet, so holders stay spread out)
-  const othersBuy = async (solIn) => {
-    const c = pump.decodeBondingCurve(chain.get(curveAddr).data);
-    const net = BigInt(Math.round(solIn * 1e9));
-    const out = (net * c.virtualTokenReserves) / (c.virtualQuoteReserves + net);
-    await chain.setCurve(mint, { virtualQuoteReserves: c.virtualQuoteReserves + net, realQuoteReserves: c.realQuoteReserves + net, virtualTokenReserves: c.virtualTokenReserves - out, realTokenReserves: c.realTokenReserves - out });
-    chain.get(curveAddr).lamports += net;
-    const ataAcc = chain.get(curveAta);
-    const held = pump.decodeTokenAccount(ataAcc.data).amount;
-    ataAcc.data = encodeTokenAccount(mint, curveAddr, held - out);
-    const holder = b58encode(nodeCrypto.randomBytes(32));
-    await chain.giveTokens(holder, mint, out);
-  };
-  const othersSell = async (fraction) => {
-    const c = pump.decodeBondingCurve(chain.get(curveAddr).data);
-    const q = BigInt(Math.round(Number(c.virtualQuoteReserves) * (1 - fraction)));
-    const k = c.virtualQuoteReserves * c.virtualTokenReserves;
-    const newT = k / q;
-    await chain.setCurve(mint, { virtualQuoteReserves: q, virtualTokenReserves: newT, realTokenReserves: c.realTokenReserves + (newT - c.virtualTokenReserves) });
-  };
-  const step = async (ms = 2500) => { clock.t += ms; await bot._poll(); };
-  const settle = async () => { for (let i = 0; i < 400 && (bot.buyInFlight || bot.draining || [...bot.positions.values()].some((p) => p.state === 'selling')); i++) await sleep(5); };
-  return { chain, bot, clock, mint, othersBuy, othersSell, step, settle, storage };
-}
-
-async function launchAndPump(t) {
-  t.bot.running = true;
-  await t.bot._addCoin({ mint: t.mint, name: 'Rocket Dog', symbol: 'RDOG', creator: null, tokenProgram: pump.TOKEN_2022, isMayhemMode: false, createdAt: t.clock.t, source: 'test' });
-  // early buyers, then a steady climb
-  for (let i = 0; i < 6; i++) { await t.othersBuy(0.6); await t.step(); }
-  for (let i = 0; i < 14 && t.bot.positions.size === 0; i++) { await t.othersBuy(0.9); await t.step(); await t.settle(); }
-}
+import { pumpLogs } from './mockchain.mjs';
+import { TestWS, SilentWS, FAST, sleep, until, bots, setup, launch, launchAndPump } from './harness.mjs';
 
 test('practice: buys a rising coin after the holder check, then takes profit', async () => {
   const t = await setup({ mode: 'practice' });
@@ -81,7 +21,13 @@ test('practice: buys a rising coin after the holder check, then takes profit', a
   const pos = [...t.bot.positions.values()][0];
   assert.equal(pos.mode, 'practice');
   assert.equal(pos.symbol, 'RDOG');
-  assert.ok(t.bot.coins.get(t.mint).holders.ok);
+  const coin = t.bot.coins.get(t.mint);
+  assert.ok(coin.holders.ok);
+  // it really studied the trades first: 45 s of them, and the score passed
+  assert.ok(pos.openedAt - coin.studyStart >= 45_000, 'studied for 45 s');
+  assert.ok(coin.verdict.ok && coin.verdict.score >= coin.verdict.need, JSON.stringify(coin.verdict.vetoes));
+  assert.ok(coin.verdict.m.uniqueBuyers >= 8);
+  assert.equal(pos.score, coin.verdict.score);
   assert.ok(t.bot.practice.balance < start);
   // the coin keeps flying -> take profit at +50%
   for (let i = 0; i < 30 && t.bot.positions.size; i++) { await t.othersBuy(2.5); await t.step(); await t.settle(); }
@@ -191,7 +137,7 @@ test('everything survives an app restart (positions, history, wallet)', async ()
   await t.othersSell(0.4);
   t.clock.t += 2500;
   await bot2._poll();
-  for (let i = 0; i < 400 && bot2.positions.size; i++) await sleep(5);
+  await until(() => bot2.positions.size === 0, 10_000);
   assert.equal(bot2.positions.size, 0);
   assert.equal(bot2.history[0].reason, 'Stop loss');
 });
@@ -300,3 +246,4 @@ test('a funded wallet is never replaced; an unreadable one only after confirming
   await t.bot.createWallet();
   assert.notEqual(t.bot.wallet.address, addr);
 });
+

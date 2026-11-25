@@ -6,7 +6,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 
 const ROOT = path.resolve(new URL('..', import.meta.url).pathname);
-const ORDER = ['bytes', 'b58', 'ed25519', 'pda', 'tx', 'keys', 'pump', 'rpc', 'feeds', 'strategy', 'trader', 'store', 'bot', 'ui', 'main'];
+const ORDER = ['bytes', 'b58', 'ed25519', 'pda', 'tx', 'keys', 'pump', 'rpc', 'feeds', 'strategy', 'analyst', 'wallets', 'trader', 'store', 'bot', 'ui', 'main'];
 
 function bundle() {
   const parts = [];
