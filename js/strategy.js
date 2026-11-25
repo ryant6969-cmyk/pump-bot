@@ -7,7 +7,7 @@ export const STYLES = {
     label: 'Careful',
     blurb: 'Only the strongest coins, small trades, quick exits.',
     tradeSol: 0.02, maxOpen: 1, takeProfitPct: 30, stopLossPct: 15,
-    trailStartPct: 20, trailDropPct: 10, maxHoldMin: 6, dailyLossSol: 0.1,
+    trailStartPct: 20, trailDropPct: 10, maxHoldMin: 6,
     buySlippagePct: 15, sellSlippagePct: 20,
     entry: {
       minAgeSec: 15, maxAgeMin: 15, scanMinSol: 1.5, maxProgress: 0.75,
@@ -20,7 +20,7 @@ export const STYLES = {
     label: 'Balanced',
     blurb: 'Strict checks, medium trades. A good place to start.',
     tradeSol: 0.05, maxOpen: 2, takeProfitPct: 45, stopLossPct: 18,
-    trailStartPct: 25, trailDropPct: 12, maxHoldMin: 10, dailyLossSol: 0.25,
+    trailStartPct: 25, trailDropPct: 12, maxHoldMin: 10,
     buySlippagePct: 15, sellSlippagePct: 25,
     entry: {
       minAgeSec: 10, maxAgeMin: 20, scanMinSol: 1.0, maxProgress: 0.8,
@@ -33,7 +33,7 @@ export const STYLES = {
     label: 'Aggressive',
     blurb: 'More trades and bigger targets. Swings both ways.',
     tradeSol: 0.1, maxOpen: 3, takeProfitPct: 90, stopLossPct: 25,
-    trailStartPct: 35, trailDropPct: 15, maxHoldMin: 15, dailyLossSol: 0.5,
+    trailStartPct: 35, trailDropPct: 15, maxHoldMin: 15,
     buySlippagePct: 20, sellSlippagePct: 30,
     entry: {
       minAgeSec: 6, maxAgeMin: 30, scanMinSol: 0.6, maxProgress: 0.85,
@@ -60,7 +60,7 @@ export const DEFAULT_SETTINGS = {
   autoBuy: true,
   speed: 'fast',
   tradeSol: null, maxOpen: null, takeProfitPct: null, stopLossPct: null,
-  trailStartPct: null, trailDropPct: null, maxHoldMin: null, dailyLossSol: null,
+  trailStartPct: null, trailDropPct: null, maxHoldMin: null,
   sellBeforeGraduation: true,
   skipMayhem: false, // mayhem coins are allowed, with stricter checks
   studySec: 10,
@@ -74,7 +74,7 @@ export const DEFAULT_SETTINGS = {
 
 const NUMERIC_LIMITS = {
   tradeSol: [0.001, 100], maxOpen: [1, 10], takeProfitPct: [1, 10000], stopLossPct: [1, 95],
-  trailStartPct: [0, 10000], trailDropPct: [1, 90], maxHoldMin: [0.5, 1440], dailyLossSol: [0.001, 1000],
+  trailStartPct: [0, 10000], trailDropPct: [1, 90], maxHoldMin: [0.5, 1440],
 };
 
 /** Bring settings saved by an older version up to date. */

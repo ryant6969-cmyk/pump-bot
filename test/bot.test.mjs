@@ -84,13 +84,12 @@ test('skips a coin when one wallet holds too much', async () => {
   assert.ok(c.holders && !c.holders.ok && /One wallet holds/.test(c.holders.reason), JSON.stringify(c.holders));
 });
 
-test('limits: no buys past the daily loss limit; max open trades respected', async () => {
+test('no daily loss limit: losing earlier today does not stop buying', async () => {
   const t = await setup({ mode: 'practice' });
-  t.bot.daily.practice = -300_000_000n; // lost 0.3 SOL today, limit is 0.25
+  t.bot.daily.practice = -5_000_000_000n; // lost 5 SOL today
   await launchAndPump(t);
-  assert.equal(t.bot.positions.size, 0);
-  assert.equal(t.bot.entryBlock, 'Daily loss limit reached');
-  assert.ok(t.bot.alerts.has('daily'));
+  assert.equal(t.bot.positions.size, 1);
+  assert.ok(!t.bot.alerts.has('daily'));
 });
 
 test('coins already in the wallet are listed but never sold without a tap', async () => {

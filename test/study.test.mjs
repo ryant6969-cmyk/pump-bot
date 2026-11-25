@@ -259,6 +259,61 @@ test('copy trading: a PumpSwap buy that already ran up 25%+ is not chased', asyn
   assert.equal(t.bot.positions.size, 0);
 });
 
+for (const mode of ['practice', 'real']) {
+  test(`copy trading (${mode}): copies every coin they buy, even when they buy many at once`, async () => {
+    const t = await setup({ mode, sol: 3 });
+    if (mode === 'practice') t.bot.practice.balance = pump.solToLamports(3);
+    const leader = b58encode(nodeCrypto.randomBytes(32));
+    await t.bot.trackWallet(leader);
+    t.bot.updateWallet(leader, { copy: true, copySol: 0.1 });
+    await sleep(5);
+    const mints = [];
+    for (let i = 0; i < 8; i++) {
+      const mint = b58encode(nodeCrypto.randomBytes(32));
+      await t.chain.addCoin({ mint });
+      mints.push(mint);
+    }
+    // they buy 8 different coins within a second
+    const evs = [];
+    for (const mint of mints) evs.push(await t.chain.trade(mint, { user: leader, sol: 0.3 }));
+    for (const ev of evs) TestWS.push(leader, pumpLogs([ev]));
+    await until(() => t.bot.positions.size === 8, 30000);
+    assert.equal(t.bot.positions.size, 8, 'all 8 copied');
+    for (const p of t.bot.positions.values()) assert.equal(p.copiedFrom, leader);
+    // a second buy of a coin already copied isn't an error
+    const again = await t.chain.trade(mints[0], { user: leader, sol: 0.2 });
+    TestWS.push(leader, pumpLogs([again]));
+    await until(() => t.bot.wallets[0].trades[0]?.note === 'Already copied this coin');
+    assert.equal(t.bot.positions.size, 8);
+  });
+}
+
+test('copy trading: when SOL runs low, copies with what is left instead of skipping', async () => {
+  const t = await setup({ mode: 'practice' });
+  t.bot.practice.balance = pump.solToLamports(0.15);
+  const leader = b58encode(nodeCrypto.randomBytes(32));
+  await t.bot.trackWallet(leader);
+  t.bot.updateWallet(leader, { copy: true, copySol: 0.1 });
+  await sleep(5);
+  const second = b58encode(nodeCrypto.randomBytes(32));
+  await t.chain.addCoin({ mint: second });
+  const a = await t.chain.trade(t.mint, { user: leader, sol: 0.3 });
+  TestWS.push(leader, pumpLogs([a]));
+  await until(() => t.bot.positions.size === 1);
+  const b = await t.chain.trade(second, { user: leader, sol: 0.3 });
+  TestWS.push(leader, pumpLogs([b]));
+  await until(() => t.bot.positions.size === 2);
+  assert.equal(t.bot.positions.size, 2);
+  assert.match(t.bot.wallets[0].trades[0].note, /all that was left/);
+  // nothing left at all: now it says so
+  const third = b58encode(nodeCrypto.randomBytes(32));
+  await t.chain.addCoin({ mint: third });
+  const c = await t.chain.trade(third, { user: leader, sol: 0.3 });
+  TestWS.push(leader, pumpLogs([c]));
+  await until(() => /not enough SOL left/.test(t.bot.wallets[0].trades[0]?.note || ''));
+  assert.match(t.bot.wallets[0].trades[0].note, /not enough SOL left/);
+});
+
 // ---------- practice money ----------
 
 test('practice money: the one-time $500 is added once the SOL price loads, and only once', async () => {

@@ -1,9 +1,9 @@
 // Everything on screen. Plain DOM, no framework. Every value that comes from
 // the network or a coin (names, symbols, errors) is escaped before display.
 
-import * as pump from './pump.js?v=2.3.0';
-import { STYLES, SPEEDS, resolveRules } from './strategy.js?v=2.3.0';
-import { isAddress } from './b58.js?v=2.3.0';
+import * as pump from './pump.js?v=2.4.0';
+import { STYLES, SPEEDS, resolveRules } from './strategy.js?v=2.4.0';
+import { isAddress } from './b58.js?v=2.4.0';
 
 export function esc(v) {
   return String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -569,7 +569,6 @@ export class UI {
         ${num('trailStartPct', 'Trailing stop starts at', '%', 5)}
         ${num('trailDropPct', 'Trailing stop drop', '%', 1)}
         ${num('maxHoldMin', 'Sell after', 'min', 1)}
-        ${num('dailyLossSol', 'Stop buying after losing', 'SOL', 0.05)}
         ${sw('sellBeforeGraduation', 'Sell before a coin graduates', 'Sells at 95% of the curve')}
         <button class="item" data-action="reset-rules"><div class="grow" style="color:var(--blue)">Use the style's defaults</div></button>
       </div>
@@ -954,7 +953,7 @@ export class UI {
           break;
         }
         case 'set': b.updateSettings({ [t.dataset.key]: t.dataset.value }); this.renderSettings(); break;
-        case 'reset-rules': b.updateSettings({ tradeSol: null, maxOpen: null, takeProfitPct: null, stopLossPct: null, trailStartPct: null, trailDropPct: null, maxHoldMin: null, dailyLossSol: null, studySec: 10, mayhemStudySec: 10, mayhemProfitMinUsd: 5, mayhemProfitMaxUsd: 10 }); this.renderSettings(); this.toast('Rules reset to the style defaults.'); break;
+        case 'reset-rules': b.updateSettings({ tradeSol: null, maxOpen: null, takeProfitPct: null, stopLossPct: null, trailStartPct: null, trailDropPct: null, maxHoldMin: null, studySec: 10, mayhemStudySec: 10, mayhemProfitMinUsd: 5, mayhemProfitMaxUsd: 10 }); this.renderSettings(); this.toast('Rules reset to the style defaults.'); break;
         case 'track': await this.trackWallet(); break;
         case 'wallet-refresh': b.refreshWallet(t.dataset.address).catch((e2) => this.toast(e2.message)); break;
         case 'wallet-remove': {

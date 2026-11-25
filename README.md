@@ -55,7 +55,7 @@ Every setting can be changed in the app.
 - Sells have one last-resort fallback so a coin never gets stuck: PumpPortal's transaction builder (0.5% fee). The bot only signs it if every instruction is one of a few exact shapes (one sell of this coin by this wallet with real price protection, at most a 0.6% fee, no approvals, no transfers of coins, no account reassignments, a normal recent blockhash), and the same test-run passes.
 - Sells never wait behind a buy. Trades that are still unconfirmed when the app closes, or whose status couldn't be checked, are re-checked when it opens again, and a buy that landed late is adopted as a normal bot trade.
 - Sell slippage only widens after the price actually moved away; a double tap can't buy the same coin twice.
-- Daily loss limit, a cap on open trades, and buying pauses after 3 failed buys in a row.
+- A cap on open trades the bot picks itself (copy trading has no cap), and buying pauses after 3 failed buys in a row.
 - Real mode never auto-starts: after the app restarts, open trades keep being managed, but buying waits for you to tap Start.
 
 ## Hosting note

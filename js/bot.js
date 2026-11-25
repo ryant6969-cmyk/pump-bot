@@ -2,23 +2,23 @@
 // and sells by its exit rules. Works the same in Practice (fake SOL, real
 // live prices) and Real mode. All state is saved on the phone.
 
-import { isAddress, b58encode } from './b58.js?v=2.3.0';
-import { Keypair } from './keys.js?v=2.3.0';
-import { associatedTokenAddress } from './pda.js?v=2.3.0';
-import * as pump from './pump.js?v=2.3.0';
-import { Rpc, ChainStream, normalizeRpcInput } from './rpc.js?v=2.3.0';
-import { CoinFeed } from './feeds.js?v=2.3.0';
-import { Trader, TradeError, readMeta } from './trader.js?v=2.3.0';
-import { DEFAULT_SETTINGS, STYLES, resolveRules, migrateSettings, evaluateScan, evaluateHolders, evaluateExit, snapAt } from './strategy.js?v=2.3.0';
-import { Tape, judge, fatalDuringStudy, flowSignals } from './analyst.js?v=2.3.0';
-import { resolveWallet, walletActivityFromLogs } from './wallets.js?v=2.3.0';
-import { fromBase64 } from './bytes.js?v=2.3.0';
+import { isAddress, b58encode } from './b58.js?v=2.4.0';
+import { Keypair } from './keys.js?v=2.4.0';
+import { associatedTokenAddress } from './pda.js?v=2.4.0';
+import * as pump from './pump.js?v=2.4.0';
+import { Rpc, ChainStream, normalizeRpcInput } from './rpc.js?v=2.4.0';
+import { CoinFeed } from './feeds.js?v=2.4.0';
+import { Trader, TradeError, readMeta } from './trader.js?v=2.4.0';
+import { DEFAULT_SETTINGS, STYLES, resolveRules, migrateSettings, evaluateScan, evaluateHolders, evaluateExit, snapAt } from './strategy.js?v=2.4.0';
+import { Tape, judge, fatalDuringStudy, flowSignals } from './analyst.js?v=2.4.0';
+import { resolveWallet, walletActivityFromLogs } from './wallets.js?v=2.4.0';
+import { fromBase64 } from './bytes.js?v=2.4.0';
 
 const POLL_MS = 2500;
 const MAX_WATCH = 99;
 const MAX_STUDY = 8; // coins studied at the same time (each is a live trade subscription)
 const MAX_WALLETS = 10;
-const MAX_COPY_OPEN = 5;
+const MIN_COPY_SOL = 0.01; // a copy smaller than this isn't worth the fees
 // Raydium's main SOL/USDC pool: the SOL price straight from the chain, through your own data key
 const RAYDIUM_SOL_USDC = '58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2';
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
@@ -810,13 +810,7 @@ export class Bot extends EventTarget {
     if (this.pausedReason) { this.entryBlock = this.pausedReason; return; }
     const mine = this._openPositions(mode).filter((p) => !p.found && !p.copiedFrom);
     if (mine.length >= rules.maxOpen) { this.entryBlock = `Holding ${mine.length} of ${rules.maxOpen} trades`; return; }
-    const lossToday = -pump.lamportsToSol(this.daily[mode] || 0n);
-    if (lossToday >= rules.dailyLossSol) {
-      this.entryBlock = 'Daily loss limit reached';
-      this._alert('daily', 'warn', `Today's loss limit (${rules.dailyLossSol} SOL) is reached, so the bot stopped buying until tomorrow. It still sells open trades.`);
-      return;
-    }
-    this._clearAlert('daily');
+    this._clearAlert('daily'); // there's no daily loss limit anymore
     const needLamports = pump.solToLamports(rules.tradeSol + (mode === 'real' ? rules.keepSolReserve + FEE_BUFFER_SOL : 0.001));
     if (this.availableLamports(mode) < needLamports) { this.entryBlock = 'Not enough SOL for another trade'; return; }
     if (this.buyInFlight || now - this.lastBuyAt < 8000) return;
@@ -930,6 +924,7 @@ export class Bot extends EventTarget {
         const cost = lamports + PRACTICE_FEE;
         if (this.practice.balance < cost) throw new TradeError('Not enough practice SOL.', { kind: 'funds' });
         this.practice.balance -= cost;
+        opts.onSpent?.();
         name = name || st.meta?.name; symbol = symbol || st.meta?.symbol;
         pos = onPool
           ? { tokens, costLamports: cost, tokenProgram: st.tokenProgram, via: 'practice', buySig: null, mayhem: !!onPool.ps.isMayhemMode, creator: onPool.ps.coinCreator, onPool: true, complete: true, pool: onPool.addr }
@@ -948,6 +943,8 @@ export class Bot extends EventTarget {
         // If that can't be read exactly, or looks wrong, use the amount spent.
         let cost = r.solDelta === null ? null : -r.solDelta - (r.rentDeposit || 0n);
         if (cost === null || cost < lamports / 2n || cost > lamports * 2n) cost = lamports + 100_000n;
+        if (r.solDelta !== null && this.balance !== null && this.balance !== undefined) this.balance += r.solDelta; // until the refresh lands
+        opts.onSpent?.();
         pos = { tokens, costLamports: cost, rentDeposit: r.rentDeposit || 0n, tokenProgram: r.tokenProgram, via: r.via, buySig: r.sig, ...(r.via === 'PumpSwap' ? { onPool: true, complete: true, pool: r.pool } : {}) };
         this.failStreak = 0;
         this.refreshBalance().catch(() => {});
@@ -1531,22 +1528,31 @@ export class Bot extends EventTarget {
     const who = this.walletLabel(w.address);
     const skip = (why) => { entry.note = 'Not copied: ' + why; this.log('skip', `Didn't copy ${who}'s buy of ${entry.symbol || short(ev.mint)}: ${why}.`, { mint: ev.mint }); this._emit(); };
     if (!this.wallet || !this.rpc) return skip('finish setup first');
-    if (this.positions.has(id) || this.buying.has(ev.mint)) return skip('you already hold it');
+    if (this.positions.has(id) || this.buying.has(ev.mint)) { entry.note = 'Already copied this coin'; this._emit(); return; }
     if (ev.solPaired === false) return skip("it isn't a SOL coin");
     if (Number(ev.solAmount) / 1e9 < w.minLeaderSol) return skip('their buy was tiny');
     if (ev.realTokenReserves === 0n) return skip('it just graduated');
     const rules = this.rules();
-    if (-pump.lamportsToSol(this.daily[mode] || 0n) >= rules.dailyLossSol) return skip("today's loss limit is reached");
-    if (this._openPositions(mode).filter((p) => p.copiedFrom).length >= MAX_COPY_OPEN) return skip(`${MAX_COPY_OPEN} copied trades are already open`);
-    const need = pump.solToLamports(w.copySol + (mode === 'real' ? rules.keepSolReserve + FEE_BUFFER_SOL : 0.001));
-    if (this.availableLamports(mode) < need) return skip('not enough SOL');
+    // every coin they buy gets copied: no cap on how many are open. If the full amount
+    // isn't there, copy with what's left (keeping the reserve and other copies in flight)
+    const reserve = pump.solToLamports(mode === 'real' ? rules.keepSolReserve + FEE_BUFFER_SOL : 0.001);
+    this.copyCommitted ||= { practice: 0n, real: 0n };
+    const free = this.availableLamports(mode) - reserve - this.copyCommitted[mode];
+    const want = pump.solToLamports(w.copySol);
+    const lamports = free < want ? free : want;
+    if (lamports < pump.solToLamports(MIN_COPY_SOL)) return skip(`not enough SOL left (${pump.lamportsToSol(free > 0n ? free : 0n).toFixed(3)} SOL free)`);
+    const sol = Number(lamports) / 1e9;
+    const smaller = lamports < want;
     // don't chase: skip if the price ran more than 25% past what they paid (checked inside the buy, no extra wait)
     const theirs = ev.price ?? Number(ev.virtualSolReserves) / Number(ev.virtualTokenReserves);
     entry.note = 'Copying…';
     this._emit();
+    this.copyCommitted[mode] += lamports;
+    let held = true;
+    const release = () => { if (held) { held = false; this.copyCommitted[mode] -= lamports; } };
     try {
-      const p = await this._buy(ev.mint, w.copySol, 'copy', { copiedFrom: w.address, ...(ev.creator ? { creator: ev.creator } : {}) }, { maxPrice: theirs > 0 ? theirs * 1.25 : null, refPrice: theirs > 0 ? theirs : null, pool: ev.pool || null });
-      entry.note = 'Copied';
+      const p = await this._buy(ev.mint, sol, 'copy', { copiedFrom: w.address, ...(ev.creator ? { creator: ev.creator } : {}) }, { maxPrice: theirs > 0 ? theirs * 1.25 : null, refPrice: theirs > 0 ? theirs : null, pool: ev.pool || null, onSpent: release });
+      entry.note = smaller ? `Copied with ${+sol.toFixed(3)} SOL (all that was left)` : 'Copied';
       // they already sold everything while our buy was landing: don't get left holding it
       if (p && !(BigInt(w.holdings[ev.mint] || 0n) > 0n) && this.positions.get(p.id) === p) {
         p.sellRequested = `${who} already sold`;
@@ -1557,6 +1563,7 @@ export class Bot extends EventTarget {
       if (e?.kind === 'skipped') skip(e.message);
       else entry.note = 'Copy failed: ' + (e.message || 'error');
     } finally {
+      release();
       this._saveWallets();
       this._emit();
     }
