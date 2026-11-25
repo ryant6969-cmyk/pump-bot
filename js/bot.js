@@ -1,0 +1,956 @@
+// The bot: watches new pump.fun coins, buys the ones that pass its rules,
+// and sells by its exit rules. Works the same in Practice (fake SOL, real
+// live prices) and Real mode. All state is saved on the phone.
+
+import { isAddress } from './b58.js';
+import { Keypair } from './keys.js';
+import { associatedTokenAddress } from './pda.js';
+import * as pump from './pump.js';
+import { Rpc, normalizeRpcInput } from './rpc.js';
+import { CoinFeed } from './feeds.js';
+import { Trader, TradeError, readMeta } from './trader.js';
+import { DEFAULT_SETTINGS, STYLES, resolveRules, evaluateEntry, evaluateHolders, evaluateExit } from './strategy.js';
+import { fromBase64 } from './bytes.js';
+
+const POLL_MS = 2500;
+const MAX_WATCH = 99;
+const COIN_TTL_MS = 20 * 60_000;
+const MAX_COINS = 400;
+const FEE_BUFFER_SOL = 0.006; // token account rent + network fees for one trade
+const PRACTICE_FEE = 100_000n; // simulated network + priority fee per practice trade
+const PRACTICE_SLIPPAGE = 98n; // practice fills get 2% worse prices, like a real busy market
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const short = (a) => (a ? a.slice(0, 4) + '…' + a.slice(-4) : '');
+function dayKey(t) { const d = new Date(t); return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate(); }
+
+export class Bot extends EventTarget {
+  constructor({ store, fetchImpl, WebSocketImpl, now, timing } = {}) {
+    super();
+    this.store = store;
+    this.fetchImpl = fetchImpl;
+    this.WebSocketImpl = WebSocketImpl;
+    this.now = now || (() => Date.now());
+    this.timing = timing;
+    this.wallet = null;
+    this.rpc = null;
+    this.trader = null;
+    this.feed = null;
+    this.running = false;
+    this.coins = new Map();
+    this.positions = new Map();
+    this.history = [];
+    this.activity = [];
+    this.pending = [];
+    this.bought = new Set();
+    this.lanes = { buy: { jobs: [], busy: false }, sell: { jobs: [], busy: false } };
+    this.balance = null;
+    this.solUsd = null;
+    this.alerts = new Map();
+    this.feedStatus = { chain: 'off', pumpportal: 'off' };
+    this.lastPollAt = 0;
+    this.lastBuyAt = 0;
+    this.failStreak = 0;
+    this.pausedReason = null;
+    this.entryBlock = null;
+    this.buyInFlight = false;
+    this.loopTimer = null;
+    this.poolCache = new Map();
+    this.buying = new Set();
+    this.pollMs = timing?.botPollMs ?? POLL_MS;
+  }
+
+  // ---------- setup & persistence ----------
+
+  async init() {
+    this.settings = { ...DEFAULT_SETTINGS, rpcInput: '', backupDone: false, setupDone: false, ...this.store.load('settings', {}) };
+    const secret = this.store.load('wallet', null);
+    if (secret) {
+      try { this.wallet = await Keypair.fromSecretText(secret); }
+      catch { this._alert('wallet', 'error', "The saved wallet couldn't be read. Import your backup key in Settings."); }
+    }
+    const st = this.store.load('state', {});
+    for (const p of st.positions || []) { p.state = 'open'; p.nextSellAt = 0; this.positions.set(p.id, p); }
+    this.history = st.history || [];
+    this.practice = st.practice || { balance: pump.solToLamports(this.settings.practiceStartSol) };
+    this.daily = st.daily || { day: dayKey(this.now()), real: 0n, practice: 0n };
+    this.pending = st.pending || [];
+    this.bought = new Set(st.bought || []);
+    this.wasRunning = !!st.running;
+    this.activity = st.activity || [];
+    this._connect();
+    if (this.rpc && this.wallet) {
+      this.refreshBalance().catch(() => {});
+      this.reconcile().catch(() => {});
+    }
+    this.refreshSolPrice();
+    this.priceTimer = setInterval(() => this.refreshSolPrice(), 5 * 60_000);
+    this._ensureLoop();
+    this._emit();
+  }
+
+  _save() {
+    this.store.save('settings', this.settings);
+    const positions = [...this.positions.values()].map(({ curve, ...p }) => p);
+    this.store.save('state', {
+      positions, history: this.history.slice(0, 300), practice: this.practice, daily: this.daily,
+      pending: this.pending, bought: [...this.bought].slice(-500), running: this.running, activity: this.activity.slice(0, 80),
+    });
+  }
+
+  _emit() {
+    if (this._emitQueued) return;
+    this._emitQueued = true;
+    queueMicrotask(() => { this._emitQueued = false; this.dispatchEvent(new Event('change')); });
+  }
+
+  log(level, message, extra = {}) {
+    this.activity.unshift({ t: this.now(), level, message, ...extra });
+    if (this.activity.length > 120) this.activity.length = 120;
+    this._emit();
+  }
+
+  _alert(key, level, message) { this.alerts.set(key, { level, message, t: this.now() }); this._emit(); }
+  _clearAlert(key) { if (this.alerts.delete(key)) this._emit(); }
+
+  rules() { return resolveRules(this.settings); }
+
+  updateSettings(patch) {
+    const before = this.settings.rpcInput;
+    this.settings = { ...this.settings, ...patch };
+    if (patch.rpcInput !== undefined && patch.rpcInput !== before) {
+      this._connect();
+      if (this.running) { this.feed?.stop(); this.feed = null; this._startFeed(); }
+    }
+    this._save();
+    this._emit();
+  }
+
+  _connect() {
+    const n = normalizeRpcInput(this.settings.rpcInput);
+    this.rpcInfo = n;
+    this.rpc = n ? new Rpc(n.http, { fetchImpl: this.fetchImpl, maxPerSecond: 8 }) : null;
+    this.trader = this.rpc && this.wallet ? new Trader({
+      rpc: this.rpc, wallet: this.wallet, fetchImpl: this.fetchImpl, timing: this.timing,
+      log: (lvl, msg) => this.log(lvl, msg),
+      onPending: (p) => { this.pending.push(p); this._save(); },
+      onSettled: (sig, uncertain) => { if (!uncertain) { this.pending = this.pending.filter((x) => x.sig !== sig); this._save(); } },
+    }) : null;
+  }
+
+  /** Check a data key / RPC URL before saving it. */
+  async testConnection(input) {
+    const n = normalizeRpcInput(input);
+    if (!n) return { ok: false, message: "That doesn't look like a Helius key or an https:// Solana address." };
+    const rpc = new Rpc(n.http, { fetchImpl: this.fetchImpl });
+    try {
+      const r = await rpc.call('getLatestBlockhash', [{ commitment: 'confirmed' }], { retries: 1, timeoutMs: 10000 });
+      if (!r?.value?.blockhash) throw new Error('bad reply');
+      return { ok: true, message: 'Connected to Solana through ' + n.label + '.' };
+    } catch (e) {
+      return { ok: false, message: e.status === 401 || e.status === 403 ? 'That key was refused. Copy it again from your Helius dashboard.' : (e.message || 'Could not connect.') };
+    }
+  }
+
+  /** Refuse to replace a wallet that still holds SOL or coins (checked fresh, not from memory). */
+  async _assertReplaceable({ confirmedBackup = false } = {}) {
+    if (!this.wallet) return;
+    if ([...this.positions.values()].some((p) => p.mode === 'real')) throw new Error('This wallet still holds coins. Sell them first.');
+    try {
+      const bal = await this.refreshBalance();
+      if (bal === null) throw new Error('no connection');
+      if (bal > 1_000_000n) throw Object.assign(new Error(`This wallet still holds ${pump.lamportsToSol(bal).toFixed(4)} SOL. Send it to Phantom first, or back up its key.`), { holdsFunds: true });
+    } catch (e) {
+      if (e.holdsFunds) throw e; // never replace a wallet that holds SOL
+      if (!confirmedBackup) throw new Error("Couldn't check the current wallet's balance. Back up its key first (Settings → Show backup key), then try again.");
+    }
+  }
+
+  async createWallet(opts = {}) {
+    await this._assertReplaceable(opts);
+    this.wallet = await Keypair.generate();
+    this.store.save('wallet', this.wallet.exportSecret());
+    this.settings.backupDone = false;
+    this._afterWalletChange();
+    return this.wallet.address;
+  }
+
+  async importWallet(text, opts = {}) {
+    const kp = await Keypair.fromSecretText(text);
+    if (this.wallet && kp.address === this.wallet.address) return kp.address;
+    await this._assertReplaceable(opts);
+    this.wallet = kp;
+    this.store.save('wallet', kp.exportSecret());
+    this.settings.backupDone = true;
+    this._afterWalletChange();
+    return kp.address;
+  }
+
+  _afterWalletChange() {
+    for (const [id, p] of this.positions) if (p.mode === 'real') this.positions.delete(id);
+    this.pending = [];
+    this.balance = null;
+    this._clearAlert('wallet');
+    this._connect();
+    this._save();
+    if (this.rpc) { this.refreshBalance().catch(() => {}); this.reconcile().catch(() => {}); }
+    this._emit();
+  }
+
+
+  exportSecret() { return this.wallet ? this.wallet.exportSecret() : null; }
+
+  resetPractice() {
+    for (const [id, p] of this.positions) if (p.mode === 'practice') this.positions.delete(id);
+    this.practice = { balance: pump.solToLamports(this.settings.practiceStartSol) };
+    this.history = this.history.filter((h) => h.mode !== 'practice');
+    this.daily.practice = 0n;
+    for (const k of [...this.bought]) if (k.startsWith('practice:')) this.bought.delete(k);
+    this._save();
+    this._emit();
+  }
+
+  /** Stop every timer and connection (used before erasing, and by tests). */
+  dispose() {
+    this.running = false;
+    this.feed?.stop();
+    this.feed = null;
+    clearInterval(this.priceTimer);
+    clearTimeout(this.loopTimer);
+    this.loopTimer = null;
+    this.disposed = true;
+  }
+
+  eraseEverything() {
+    this.stop();
+    clearInterval(this.priceTimer);
+    this.store.clearAll();
+  }
+
+  // ---------- money ----------
+
+  async refreshBalance() {
+    if (!this.rpc || !this.wallet) return null;
+    const r = await this.rpc.call('getBalance', [this.wallet.address, { commitment: 'confirmed' }]);
+    this.balance = BigInt(r.value);
+    this._emit();
+    return this.balance;
+  }
+
+  async refreshSolPrice() {
+    try {
+      const f = this.fetchImpl || ((...a) => globalThis.fetch(...a));
+      const r = await f('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+      const j = await r.json();
+      const v = Number(j?.solana?.usd);
+      if (v > 0 && v < 100000) { this.solUsd = v; this._emit(); }
+    } catch { /* show SOL only */ }
+  }
+
+  availableLamports(mode = this.settings.mode) {
+    return mode === 'practice' ? this.practice.balance : (this.balance ?? 0n);
+  }
+
+  _rollDay() {
+    const k = dayKey(this.now());
+    if (this.daily.day !== k) this.daily = { day: k, real: 0n, practice: 0n };
+  }
+
+  // ---------- start / stop ----------
+
+  canStart() {
+    if (!this.wallet) return { ok: false, message: 'Set up your bot wallet first.' };
+    if (!this.rpc) return { ok: false, message: 'Add your free data key in Settings first.' };
+    const rules = this.rules();
+    if (this.settings.mode === 'real') {
+      const need = rules.tradeSol + rules.keepSolReserve + FEE_BUFFER_SOL;
+      const have = pump.lamportsToSol(this.balance ?? 0n);
+      if (have < need) return { ok: false, message: `Add SOL to the bot wallet first. One ${rules.tradeSol} SOL trade needs about ${need.toFixed(3)} SOL with fees; it has ${have.toFixed(3)}.` };
+    } else if (pump.lamportsToSol(this.practice.balance) < rules.tradeSol + 0.001) {
+      return { ok: false, message: 'Your practice balance is too low. Reset it in Settings.' };
+    }
+    return { ok: true };
+  }
+
+  async start() {
+    if (this.running) return;
+    if (this.settings.mode === 'real') await this.refreshBalance().catch(() => {});
+    const c = this.canStart();
+    if (!c.ok) throw new Error(c.message);
+    this.running = true;
+    this.wasRunning = false;
+    this.pausedReason = null;
+    this.failStreak = 0;
+    this._startFeed();
+    this._ensureLoop();
+    const s = STYLES[this.settings.style]?.label || 'Balanced';
+    this.log('info', `Bot started: ${this.settings.mode === 'real' ? 'REAL money' : 'Practice'}, ${s} style.`);
+    this._save();
+  }
+
+  stop() {
+    if (!this.running) return;
+    this.running = false;
+    this.feed?.stop();
+    this.feed = null;
+    this.feedStatus = { chain: 'off', pumpportal: 'off' };
+    this.log('info', 'Bot stopped. It still watches open trades until they are sold.');
+    this._save();
+  }
+
+  resume() {
+    this.pausedReason = null;
+    this.failStreak = 0;
+    this._clearAlert('paused');
+    this._emit();
+  }
+
+  _startFeed() {
+    if (this.feed) return;
+    this.feed = new CoinFeed({
+      wsUrl: this.rpcInfo?.ws,
+      WebSocketImpl: this.WebSocketImpl,
+      onStatus: (s) => { this.feedStatus = { ...s }; this._emit(); },
+      onCoin: (c) => this._addCoin(c),
+    });
+    this.feed.start();
+  }
+
+  /** Called when the app comes back to the screen. */
+  async onResume(hiddenMs) {
+    if (hiddenMs > 20000 && this.running) {
+      this.feed?.stop();
+      this.feed = null;
+      this._startFeed();
+    }
+    clearTimeout(this.loopTimer);
+    this.loopTimer = null;
+    this._ensureLoop();
+    if (this.rpc && this.wallet) {
+      this.refreshBalance().catch(() => {});
+      this.reconcile().catch(() => {});
+    }
+  }
+
+  // ---------- coins ----------
+
+  async _addCoin(c) {
+    if (this.coins.has(c.mint)) return;
+    const coin = { ...c, curveAddr: null, snaps: [], curve: null, eval: null, holders: null, holderCheckedAt: 0, watching: true };
+    this.coins.set(c.mint, coin);
+    coin.curveAddr = await pump.bondingCurveAddress(c.mint);
+    if (this.coins.size > MAX_COINS) this._pruneCoins(this.now(), true);
+    this._emit();
+  }
+
+  _pruneCoins(now, force = false) {
+    const held = new Set([...this.positions.values()].map((p) => p.mint));
+    for (const [m, c] of this.coins) {
+      if (held.has(m)) continue;
+      if (now - c.createdAt > COIN_TTL_MS) this.coins.delete(m);
+    }
+    if (force && this.coins.size > MAX_COINS) {
+      const old = [...this.coins.values()].filter((c) => !held.has(c.mint)).sort((a, b) => a.createdAt - b.createdAt);
+      for (const c of old.slice(0, this.coins.size - MAX_COINS)) this.coins.delete(c.mint);
+    }
+  }
+
+  _coinsToWatch(now, capacity) {
+    const maxAge = this.rules().entry.maxAgeMin * 60_000;
+    const list = [...this.coins.values()].filter((c) => c.curveAddr && c.watching && now - c.createdAt <= maxAge);
+    // newest first, then the ones already moving
+    list.sort((a, b) => (b.lastProgress || 0) - (a.lastProgress || 0) || b.createdAt - a.createdAt);
+    const young = list.filter((c) => now - c.createdAt < 90_000).sort((a, b) => b.createdAt - a.createdAt);
+    const rest = list.filter((c) => now - c.createdAt >= 90_000);
+    return [...young, ...rest].slice(0, Math.max(0, capacity));
+  }
+
+  _openPositions(mode = null) {
+    return [...this.positions.values()].filter((p) => !mode || p.mode === mode);
+  }
+
+  // ---------- main loop ----------
+
+  _ensureLoop() {
+    if (this.loopTimer) return;
+    this.loopTimer = setTimeout(() => this._tick(), 0);
+  }
+
+  async _tick() {
+    this.loopTimer = null;
+    if (this.ticking || this.disposed) return;
+    const needed = this.running || this.positions.size > 0;
+    if (!needed || !this.rpc) return;
+    this.ticking = true;
+    try {
+      await this._poll();
+      this._clearAlert('rpc');
+      // every 90 s, re-check the wallet itself (catches anything that changed outside the app)
+      if (this.trader && this.now() - (this.lastReconcileAt || 0) > 90_000) {
+        this.lastReconcileAt = this.now();
+        this.reconcile().catch(() => {});
+      }
+    } catch (e) {
+      if (this.rpc?.failStreak >= 3 || e?.status === 401 || e?.status === 403) {
+        this._alert('rpc', 'error', e?.status === 429 ? 'Your free data plan is busy or used up. The bot is slowing down.' : 'Connection problem: ' + (e?.message || 'unknown'));
+      }
+    } finally {
+      this.ticking = false;
+    }
+    if (!this.loopTimer && !this.disposed && (this.running || this.positions.size > 0)) {
+      // back off when the connection is struggling (e.g. the free plan's rate limit)
+      const slow = (this.rpc?.failStreak || 0) > 3 ? 4 : 1;
+      this.loopTimer = setTimeout(() => this._tick(), this.pollMs * slow);
+    }
+  }
+
+  async _poll() {
+    const now = this.now();
+    this._rollDay();
+    this._pruneCoins(now);
+    const positions = this._openPositions();
+    const addrs = [];
+    const seen = new Set();
+    const add = (a) => { if (a && !seen.has(a) && addrs.length < 100) { seen.add(a); addrs.push(a); } };
+    for (const p of positions) add(p.curveAddr);
+    const watch = this.running ? this._coinsToWatch(now, MAX_WATCH - addrs.length) : [];
+    for (const c of watch) add(c.curveAddr);
+    // read each new coin's mint once to learn its token program and name
+    const needMint = [...this.coins.values()].filter((c) => !c.tokenProgram && seen.has(c.curveAddr)).slice(0, Math.max(0, 100 - addrs.length));
+    for (const c of needMint) add(c.mint);
+    if (!addrs.length) return;
+    const res = await this.rpc.call('getMultipleAccounts', [addrs, { encoding: 'base64', commitment: 'confirmed' }]);
+    const byAddr = new Map();
+    res.value.forEach((a, i) => { if (a) byAddr.set(addrs[i], { owner: a.owner, data: fromBase64(a.data[0]) }); });
+    for (const c of needMint) {
+      const m = byAddr.get(c.mint);
+      if (m && (m.owner === pump.TOKEN || m.owner === pump.TOKEN_2022)) c.tokenProgram = m.owner;
+    }
+    const t = this.now();
+    for (const c of watch) {
+      const acc = byAddr.get(c.curveAddr);
+      const curve = acc && acc.owner === pump.PUMP ? pump.decodeBondingCurve(acc.data) : null;
+      if (!curve) continue;
+      this._recordCurve(c, curve, t);
+    }
+    for (const p of positions) {
+      const acc = byAddr.get(p.curveAddr);
+      const curve = acc && acc.owner === pump.PUMP ? pump.decodeBondingCurve(acc.data) : null;
+      await this._valuePosition(p, curve, t);
+    }
+    this.lastPollAt = t;
+    for (const p of positions) this._maybeExit(p, t);
+    if (this.running && this.settings.autoBuy) this._maybeEnter(t);
+    this._emit();
+  }
+
+  _recordCurve(c, curve, t) {
+    const mcap = pump.lamportsToSol(pump.curveMarketCapLamports(curve));
+    const progress = pump.curveProgress(curve);
+    c.curve = { complete: curve.complete, isMayhemMode: curve.isMayhemMode, isCashbackCoin: curve.isCashbackCoin, solPaired: pump.isSolPaired(curve), depth: curve.depth, tokenTotalSupply: curve.tokenTotalSupply };
+    if (c.isMayhemMode === null || c.isMayhemMode === undefined) c.isMayhemMode = curve.isMayhemMode;
+    if (!c.creator || c.creator === pump.DEFAULT_PUBKEY) c.creator = curve.creator;
+    c.snaps.push({ t, mcap, progress });
+    if (c.snaps.length > 80) c.snaps.splice(0, c.snaps.length - 80);
+    c.lastMcap = mcap;
+    c.lastProgress = progress;
+    const peak = Math.max(...c.snaps.map((s) => s.mcap));
+    // stop watching coins that died
+    const age = t - c.createdAt;
+    if ((age > 180_000 && progress < 0.02) || (age > 60_000 && mcap < peak * 0.4) || curve.complete) c.watching = false;
+  }
+
+  async _valuePosition(p, curve, t) {
+    if (curve) {
+      p.complete = curve.complete;
+      p.progress = pump.curveProgress(curve);
+      p.mcapSol = pump.lamportsToSol(pump.curveMarketCapLamports(curve));
+      if (!curve.complete) {
+        p.lastValueLamports = pump.curveSellLamportsOut(curve, BigInt(p.tokens));
+        p.valuedAt = t;
+      }
+    }
+    if (p.complete) {
+      const v = await this._poolValue(p.mint, BigInt(p.tokens)).catch(() => null);
+      if (v !== null) { p.lastValueLamports = v; p.valuedAt = t; }
+    }
+    if (p.lastValueLamports !== undefined) {
+      if (p.found && !(BigInt(p.costLamports) > 0n)) p.costLamports = p.lastValueLamports;
+      if (BigInt(p.peakValueLamports || 0n) < BigInt(p.lastValueLamports)) p.peakValueLamports = p.lastValueLamports;
+    }
+  }
+
+  async _poolValue(mint, tokens) {
+    const hit = this.poolCache.get(mint);
+    let pool = hit && this.now() - hit.at < 4000 ? hit : null;
+    if (!pool) {
+      const addr = await pump.canonicalPoolAddress(mint);
+      const r1 = await this.rpc.call('getMultipleAccounts', [[addr], { encoding: 'base64', commitment: 'confirmed' }]);
+      const a = r1.value[0];
+      const ps = a && a.owner === pump.PUMP_AMM ? pump.decodePool(fromBase64(a.data[0])) : null;
+      if (!ps) return null;
+      const r2 = await this.rpc.call('getMultipleAccounts', [[ps.poolBaseTokenAccount, ps.poolQuoteTokenAccount], { encoding: 'base64', commitment: 'confirmed' }]);
+      const base = r2.value[0] ? pump.decodeTokenAccount(fromBase64(r2.value[0].data[0]))?.amount ?? 0n : 0n;
+      const quote = (r2.value[1] ? pump.decodeTokenAccount(fromBase64(r2.value[1].data[0]))?.amount ?? 0n : 0n) + ps.virtualQuoteReserves;
+      pool = { base, quote, at: this.now() };
+      this.poolCache.set(mint, pool);
+    }
+    return pump.poolSellLamportsOut(pool.base, pool.quote, tokens);
+  }
+
+  // ---------- buying ----------
+
+  _maybeEnter(now) {
+    const rules = this.rules();
+    const mode = this.settings.mode;
+    this.entryBlock = null;
+    if (this.pausedReason) { this.entryBlock = this.pausedReason; return; }
+    const mine = this._openPositions(mode).filter((p) => !p.found);
+    if (mine.length >= rules.maxOpen) { this.entryBlock = `Holding ${mine.length} of ${rules.maxOpen} trades`; return; }
+    const lossToday = -pump.lamportsToSol(this.daily[mode] || 0n);
+    if (lossToday >= rules.dailyLossSol) {
+      this.entryBlock = 'Daily loss limit reached';
+      this._alert('daily', 'warn', `Today's loss limit (${rules.dailyLossSol} SOL) is reached, so the bot stopped buying until tomorrow. It still sells open trades.`);
+      return;
+    }
+    this._clearAlert('daily');
+    const needLamports = pump.solToLamports(rules.tradeSol + (mode === 'real' ? rules.keepSolReserve + FEE_BUFFER_SOL : 0.001));
+    if (this.availableLamports(mode) < needLamports) { this.entryBlock = 'Not enough SOL for another trade'; return; }
+    if (this.buyInFlight || now - this.lastBuyAt < 8000) return;
+    const ready = [];
+    for (const c of this.coins.values()) {
+      if (!c.watching || !c.curve || !c.tokenProgram) continue;
+      if (this.bought.has(mode + ':' + c.mint) || this.positions.has(mode + ':' + c.mint)) continue;
+      c.eval = evaluateEntry({ ...c, curve: { ...c.curve, isMayhemMode: c.curve.isMayhemMode } }, rules, now);
+      if (c.eval.ok && !(c.holders && !c.holders.ok && now - c.holderCheckedAt < 30_000)) ready.push(c);
+    }
+    if (!ready.length) return;
+    ready.sort((a, b) => (b.eval.rise60 || 0) - (a.eval.rise60 || 0));
+    this._checkAndBuy(ready[0], rules);
+  }
+
+  async _checkAndBuy(coin, rules) {
+    this.buyInFlight = true;
+    coin.status = 'Checking holders';
+    this._emit();
+    try {
+      const h = await this._holderCheck(coin, rules);
+      coin.holders = h;
+      coin.holderCheckedAt = this.now();
+      if (!h.ok) { coin.status = 'Skipped: ' + h.reason; return; }
+      if (!this.running) return;
+      coin.status = 'Buying';
+      await this._buy(coin.mint, rules.tradeSol, 'auto');
+    } catch (e) {
+      coin.status = 'Buy failed';
+    } finally {
+      this.buyInFlight = false;
+      this._emit();
+    }
+  }
+
+  async _holderCheck(coin, rules) {
+    const r = await this.rpc.call('getTokenLargestAccounts', [coin.mint, { commitment: 'confirmed' }]);
+    const holders = (r.value || []).map((h) => ({ address: h.address, amount: BigInt(h.amount) }));
+    const curveAta = await associatedTokenAddress(coin.curveAddr, coin.mint, coin.tokenProgram);
+    const devAta = coin.creator && coin.creator !== pump.DEFAULT_PUBKEY ? await associatedTokenAddress(coin.creator, coin.mint, coin.tokenProgram) : null;
+    return evaluateHolders({ holders, supply: coin.curve?.tokenTotalSupply || 1_000_000_000_000_000n, excludeAddresses: [curveAta], devAccount: devAta }, rules);
+  }
+
+  /** Buy now, from the bot (auto) or from a tap (manual). */
+  async manualBuy(mint, sol) {
+    mint = String(mint || '').trim();
+    if (!isAddress(mint)) throw new Error("That isn't a valid coin address.");
+    const amount = Number(sol);
+    if (!(amount > 0)) throw new Error('Enter how much SOL to spend.');
+    if (!this.wallet || !this.rpc) throw new Error('Finish setup first (wallet and data key).');
+    const mode = this.settings.mode;
+    if (this.buying.has(mint)) throw new Error('Already buying this coin.');
+    if (this.positions.has(mode + ':' + mint)) throw new Error('You already hold this coin. Sell it first.');
+    this.buying.add(mint); // claim it before anything async, so a double tap can't buy twice
+    try {
+      const rules = this.rules();
+      const need = pump.solToLamports(amount + (mode === 'real' ? rules.keepSolReserve + FEE_BUFFER_SOL : 0.0001));
+      if (mode === 'real') await this.refreshBalance().catch(() => {});
+      if (this.availableLamports(mode) < need) throw new Error(`Not enough SOL. This needs about ${pump.lamportsToSol(need).toFixed(3)} SOL with fees.`);
+      return await this._buy(mint, amount, 'manual');
+    } finally {
+      this.buying.delete(mint);
+    }
+  }
+
+  async _buy(mint, sol, source) {
+    const mode = this.settings.mode;
+    const id = mode + ':' + mint;
+    const rules = this.rules();
+    const lamports = pump.solToLamports(sol);
+    const coin = this.coins.get(mint);
+    this.bought.add(id);
+    this.buying.add(mint);
+    this.lastBuyAt = this.now();
+    let name = coin?.name, symbol = coin?.symbol;
+    try {
+      let pos;
+      if (mode === 'practice') {
+        const st = await this._readCoin(mint);
+        const c = st.curve;
+        if (!c) throw new TradeError("This isn't a pump.fun coin.", { kind: 'unsupported' });
+        if (c.complete) throw new TradeError('This coin already graduated. The bot only buys coins still on pump.fun.', { kind: 'unsupported' });
+        if (!pump.isSolPaired(c) || c.isCashbackCoin) throw new TradeError("This coin type can't be traded by the bot.", { kind: 'unsupported' });
+        const tokens = (pump.curveBuyTokensOut(c, lamports) * PRACTICE_SLIPPAGE) / 100n;
+        if (tokens <= 0n) throw new TradeError('Nothing left to buy on this coin.', { kind: 'unsupported' });
+        const cost = lamports + PRACTICE_FEE;
+        if (this.practice.balance < cost) throw new TradeError('Not enough practice SOL.', { kind: 'funds' });
+        this.practice.balance -= cost;
+        name = name || st.meta?.name; symbol = symbol || st.meta?.symbol;
+        pos = { tokens, costLamports: cost, tokenProgram: st.tokenProgram, via: 'practice', buySig: null };
+      } else {
+        const r = await this._queueTrade(() => this.trader.buy({ mint, lamports, slippagePct: rules.buySlippagePct, speed: rules.speed }), 'buy');
+        let tokens = r.tokDelta;
+        if (tokens === null) {
+          // landed, but the exact amounts couldn't be read: use the wallet's balance
+          const held = (await this.trader.walletTokens().catch(() => [])).find((t) => t.mint === mint);
+          tokens = held ? held.amount : null;
+        }
+        if (!(tokens > 0n)) throw Object.assign(new TradeError('The buy went through but the coins could not be found yet. The bot will pick them up on its next wallet check.', { kind: 'failed', sig: r.sig }), { sent: true, uncertain: true });
+        if (!name) { const st = await this._readCoin(mint).catch(() => null); name = st?.meta?.name; symbol = st?.meta?.symbol; }
+        // Cost = SOL that left the wallet, minus the refundable token-account deposit.
+        // If that can't be read exactly, or looks wrong, use the amount spent.
+        let cost = r.solDelta === null ? null : -r.solDelta - (r.rentDeposit || 0n);
+        if (cost === null || cost < lamports / 2n || cost > lamports * 2n) cost = lamports + 100_000n;
+        pos = { tokens, costLamports: cost, rentDeposit: r.rentDeposit || 0n, tokenProgram: r.tokenProgram, via: r.via, buySig: r.sig };
+        this.failStreak = 0;
+        this.refreshBalance().catch(() => {});
+      }
+      const p = {
+        id, mode, mint, name: name || 'Coin ' + short(mint), symbol: symbol || short(mint),
+        curveAddr: await pump.bondingCurveAddress(mint), source, managed: true,
+        openedAt: this.now(), peakValueLamports: 0n, lastValueLamports: undefined, state: 'open', sellAttempts: 0, nextSellAt: 0,
+        ...pos,
+      };
+      const existing = this.positions.get(id);
+      if (existing) {
+        // never overwrite: add to what's already held
+        existing.tokens = BigInt(existing.tokens) + BigInt(p.tokens);
+        existing.costLamports = BigInt(existing.costLamports || 0n) + BigInt(p.costLamports);
+      } else {
+        this.positions.set(id, p);
+      }
+      if (coin) coin.status = 'Bought';
+      try { const st = await this._readCoin(mint); await this._valuePosition(p, st.curve, this.now()); } catch { /* valued on the next check */ }
+      this.log('buy', `Bought ${p.symbol} for ${sol} SOL${mode === 'practice' ? ' (practice)' : ''}.`, { mint, sig: p.buySig });
+      this._save();
+      this._ensureLoop();
+      return p;
+    } catch (e) {
+      // Allow another try only when we know nothing was bought.
+      // ('expired' is not on this list: a lagging node could have hidden a buy that did land)
+      const nothingBought = !e?.uncertain && ((e?.name === 'RpcError' && !e?.sent) || (e instanceof TradeError && (e.kind === 'slippage' || (e.kind === 'network' && !e.sent))));
+      if (nothingBought) this.bought.delete(id);
+      if (mode === 'real' && source === 'auto' && e?.kind !== 'unsupported') {
+        this.failStreak++;
+        if (this.failStreak >= 3) {
+          this.pausedReason = 'Paused after 3 failed buys';
+          this._alert('paused', 'error', 'Buying paused after 3 failed buys in a row. Check the activity list, then tap Resume.');
+        }
+      }
+      this.log('error', `Couldn't buy ${symbol || short(mint)}: ${e.message}`, { mint, sig: e.sig || null });
+      this._save();
+      throw e;
+    } finally {
+      this.buying.delete(mint);
+    }
+  }
+
+  /** Name, market cap and progress of any coin (for a pasted address). */
+  async lookupCoin(mint) {
+    if (!isAddress(mint)) throw new Error("That isn't a coin address.");
+    const st = await this._readCoin(mint);
+    if (!st.curve) throw new Error("This isn't a pump.fun coin (or it's very old).");
+    return {
+      name: st.meta?.name, symbol: st.meta?.symbol,
+      mcap: pump.lamportsToSol(pump.curveMarketCapLamports(st.curve)),
+      progress: pump.curveProgress(st.curve), complete: st.curve.complete,
+    };
+  }
+
+  async _readCoin(mint) {
+    const curveAddr = await pump.bondingCurveAddress(mint);
+    const r = await this.rpc.call('getMultipleAccounts', [[curveAddr, mint], { encoding: 'base64', commitment: 'confirmed' }]);
+    const [ca, ma] = r.value;
+    if (!ma) throw new TradeError("That coin address doesn't exist on Solana.", { kind: 'unsupported' });
+    const mintData = fromBase64(ma.data[0]);
+    const curve = ca && ca.owner === pump.PUMP ? pump.decodeBondingCurve(fromBase64(ca.data[0])) : null;
+    return { curve, tokenProgram: ma.owner, meta: pump.decodeToken2022Metadata(mintData) };
+  }
+
+  // ---------- selling ----------
+
+  _maybeExit(p, now) {
+    if (p.state === 'selling') return;
+    if (p.nextSellAt && now < p.nextSellAt) return;
+    if (p.sellRequested) { this._sell(p, p.sellRequested); return; }
+    if (!p.managed || p.lastValueLamports === undefined) return;
+    if (p.valuedAt && now - p.valuedAt > 20_000 && !p.complete) return; // stale price: don't act on it
+    const d = evaluateExit({ ...p, openedAt: p.openedAt }, p.lastValueLamports, this.rules(), { progress: p.progress ?? 0, complete: !!p.complete }, now);
+    if (d.sell) this._sell(p, d.reason);
+  }
+
+  sellNow(id) {
+    const p = this.positions.get(id);
+    if (!p) return;
+    p.sellRequested = 'Sold by you';
+    p.nextSellAt = 0;
+    this._ensureLoop();
+    if (p.state !== 'selling') this._sell(p, 'Sold by you');
+  }
+
+  sellAll() {
+    for (const p of this.positions.values()) { p.sellRequested = 'Sell all'; p.nextSellAt = 0; if (p.state !== 'selling') this._sell(p, 'Sell all'); }
+    this._ensureLoop();
+  }
+
+  async _sell(p, reason) {
+    if (p.state === 'selling') return;
+    p.state = 'selling';
+    p.sellReason = reason;
+    this._emit();
+    const rules = this.rules();
+    try {
+      let proceeds, sig = null, via = 'practice';
+      if (p.mode === 'practice') {
+        let value = p.lastValueLamports;
+        if (value === undefined) value = 0n;
+        proceeds = (BigInt(value) * PRACTICE_SLIPPAGE) / 100n - PRACTICE_FEE;
+        if (proceeds < 0n) proceeds = 0n;
+        this.practice.balance += proceeds;
+      } else {
+        // more room for the price only after the price actually moved away from us
+        const slip = Math.min(60, rules.sellSlippagePct + (p.slipSteps || 0) * 15);
+        const r = await this._queueTrade(() => this.trader.sell({ mint: p.mint, tokenProgram: p.tokenProgram, amount: null, slippagePct: slip, speed: rules.speed }), 'sell');
+        proceeds = r.solDelta;
+        sig = r.sig;
+        via = r.via;
+        this._queueTrade(() => this.trader.closeEmptyTokenAccount(p.mint, p.tokenProgram), 'sell').then(() => this.refreshBalance()).catch(() => {});
+        this.refreshBalance().catch(() => {});
+      }
+      this._close(p, { proceeds, reason, sig, via });
+    } catch (e) {
+      p.sellAttempts = (p.sellAttempts || 0) + 1;
+      p.lastError = e.message;
+      const now = this.now();
+      if (e instanceof TradeError && e.kind === 'gone') {
+        // Stay "selling" while we check, so nothing else closes it at the same time.
+        const landed = await this._landedSell(p).catch(() => null);
+        p.goneSeen = (p.goneSeen || 0) + 1;
+        if (landed || p.goneSeen >= 2) {
+          this._close(p, { proceeds: landed?.solDelta ?? null, reason: landed ? reason : 'Sold outside the bot', sig: landed?.sig || null, via: 'unknown' });
+          return;
+        }
+        // one empty read can be a lagging node: look again shortly
+        p.state = 'open';
+        p.nextSellAt = now + 4000;
+        this._save();
+        this._ensureLoop();
+        return;
+      }
+      p.state = 'open';
+      p.goneSeen = 0;
+      const kind = e?.kind;
+      if (kind === 'slippage') { p.slipSteps = (p.slipSteps || 0) + 1; p.nextSellAt = now + 300; }
+      else if (kind === 'waiting') p.nextSellAt = now + 5000;
+      else if (kind === 'funds') {
+        p.nextSellAt = now + 15000;
+        this._alert('fees', 'error', 'The bot wallet needs a little SOL (0.005) to pay the network fee for selling. Send some from Phantom.');
+      } else p.nextSellAt = now + Math.min(30000, 1500 * 2 ** Math.min(5, p.sellAttempts));
+      this.log('error', `Couldn't sell ${p.symbol} yet: ${e.message} Trying again.`, { mint: p.mint, sig: e.sig || null });
+      this._save();
+      this._ensureLoop();
+    }
+  }
+
+  _close(p, { proceeds, reason, sig, via }) {
+    if (p.closed || this.positions.get(p.id) !== p) return; // already closed
+    p.closed = true;
+    this.positions.delete(p.id);
+    const cost = BigInt(p.costLamports || 0n);
+    const pnl = proceeds === null ? null : BigInt(proceeds) - cost;
+    if (pnl !== null && !p.found) {
+      this._rollDay();
+      this.daily[p.mode] = (this.daily[p.mode] || 0n) + pnl;
+    }
+    this.history.unshift({
+      id: p.id + ':' + this.now(), mode: p.mode, mint: p.mint, name: p.name, symbol: p.symbol,
+      openedAt: p.openedAt, closedAt: this.now(), costLamports: cost, proceedsLamports: proceeds, pnlLamports: pnl,
+      reason, buySig: p.buySig || null, sellSig: sig, via, found: !!p.found,
+    });
+    if (this.history.length > 300) this.history.length = 300;
+    if (p.mode === 'real') this._clearAlert('fees');
+    const pct = pnl !== null && cost > 0n ? (Number(pnl) / Number(cost)) * 100 : null;
+    this.log(pnl !== null && pnl >= 0n ? 'win' : 'loss',
+      `Sold ${p.symbol}${pct !== null ? ` ${pct >= 0 ? '+' : ''}${pct.toFixed(0)}%` : ''} (${reason})${p.mode === 'practice' ? ' (practice)' : ''}.`, { mint: p.mint, sig });
+    this._save();
+    this._emit();
+  }
+
+  async _landedSell(p) {
+    const sigs = this.pending.filter((x) => x.mint === p.mint && x.kind === 'sell').map((x) => x.sig);
+    for (const sig of sigs) {
+      const t = await this.rpc.call('getTransaction', [sig, { encoding: 'json', commitment: 'confirmed', maxSupportedTransactionVersion: 1 }]);
+      if (t?.meta && !t.meta.err) {
+        this.pending = this.pending.filter((x) => x.sig !== sig);
+        return { sig, ...readMeta(t, this.wallet.address, null) };
+      }
+    }
+    return null;
+  }
+
+  // ---------- trades run one at a time per lane; sells never wait behind a buy ----------
+
+  _queueTrade(fn, lane = 'buy') {
+    const L = this.lanes[lane];
+    return new Promise((resolve, reject) => {
+      L.jobs.push({ fn, resolve, reject });
+      this._drain(L);
+    });
+  }
+
+  async _drain(L) {
+    if (L.busy) return;
+    L.busy = true;
+    try {
+      while (L.jobs.length) {
+        const job = L.jobs.shift();
+        try { job.resolve(await job.fn()); } catch (e) { job.reject(e); }
+      }
+    } finally {
+      L.busy = false;
+    }
+  }
+
+  _tradesBusy() {
+    return Object.values(this.lanes).some((L) => L.busy || L.jobs.length);
+  }
+
+  get draining() { return this._tradesBusy(); }
+
+  // ---------- wallet ----------
+
+  async withdraw(to, sol) {
+    to = String(to || '').trim();
+    if (!isAddress(to)) throw new Error("That isn't a Solana address. Copy your Phantom address again.");
+    if (to === this.wallet?.address) throw new Error("That's the bot wallet itself. Paste your Phantom address.");
+    const bal = await this.refreshBalance();
+    let lamports = sol === 'max' ? bal - 2_000_000n : pump.solToLamports(sol);
+    if (lamports <= 0n) throw new Error('There is nothing to withdraw.');
+    if (lamports > bal - 1_000_000n) throw new Error('That is more than the wallet holds (keep about 0.001 SOL for the fee).');
+    const r = await this._queueTrade(() => this.trader.withdraw({ to, lamports }), 'buy');
+    this.log('info', `Sent ${pump.lamportsToSol(lamports).toFixed(4)} SOL to ${short(to)}.`, { sig: r.sig });
+    await this.refreshBalance().catch(() => {});
+    return r;
+  }
+
+  /** Re-check unconfirmed trades and adopt coins the wallet holds. */
+  reconcile() {
+    if (!this.trader) return Promise.resolve();
+    if (!this.reconcileRun) this.reconcileRun = this._reconcile().finally(() => { this.reconcileRun = null; });
+    return this.reconcileRun;
+  }
+
+  async _reconcile() {
+    this.reconciling = true;
+    try {
+      const now = this.now();
+      if (this.pending.length) {
+        const sigs = this.pending.map((x) => x.sig);
+        const r = await this.rpc.call('getSignatureStatuses', [sigs, { searchTransactionHistory: true }]);
+        const keep = [];
+        this.pending.forEach((x, i) => {
+          const st = r.value?.[i];
+          if (!st && now - x.at < 180_000) keep.push(x);
+          else if (st && !st.err && (x.kind === 'sell' || x.kind === 'buy')) keep.push({ ...x, landed: true }); // matched below
+        });
+        this.pending = keep;
+      }
+      const tokens = await this.trader.walletTokens();
+      const held = new Map(tokens.filter((t) => t.amount > 0n && t.mint !== pump.WSOL).map((t) => [t.mint, t]));
+      for (const t of held.values()) {
+        const id = 'real:' + t.mint;
+        const p = this.positions.get(id);
+        if (p) {
+          p.missingSeen = 0;
+          if (p.state !== 'selling' && BigInt(p.tokens) !== t.amount) {
+            // more coins than we booked? a second buy landed after all: add its exact cost
+            const extra = t.amount > BigInt(p.tokens) && this.pending.find((x) => x.kind === 'buy' && x.mint === t.mint && x.landed && x.sig !== p.buySig);
+            if (extra) {
+              const tx = await this.rpc.call('getTransaction', [extra.sig, { encoding: 'json', commitment: 'confirmed', maxSupportedTransactionVersion: 1 }]).catch(() => null);
+              if (tx?.meta && !tx.meta.err) {
+                const d = readMeta(tx, this.wallet.address, t.ata);
+                const add = -d.solDelta - d.rentDeposit;
+                if (add > 0n) p.costLamports = BigInt(p.costLamports || 0n) + add;
+                this.pending = this.pending.filter((x) => x.sig !== extra.sig);
+              }
+            }
+            p.tokens = t.amount;
+          }
+          this.pending = this.pending.filter((x) => !(x.kind === 'buy' && x.sig === p.buySig && x.landed));
+          continue;
+        }
+        if (this._tradesBusy() || this.buying.has(t.mint)) continue;
+        const meta = await this._readCoin(t.mint).catch(() => null);
+        const landedBuy = this.pending.find((x) => x.kind === 'buy' && x.mint === t.mint && x.landed);
+        if (landedBuy) {
+          // The app closed mid-buy: adopt it as a normal bot trade with its exact cost.
+          const tx = await this.rpc.call('getTransaction', [landedBuy.sig, { encoding: 'json', commitment: 'confirmed', maxSupportedTransactionVersion: 1 }]).catch(() => null);
+          if (tx?.meta) {
+            const d = readMeta(tx, this.wallet.address, t.ata);
+            this.pending = this.pending.filter((x) => x.sig !== landedBuy.sig);
+            this.bought.add(id);
+            this.positions.set(id, {
+              id, mode: 'real', mint: t.mint, name: meta?.meta?.name || 'Coin ' + short(t.mint), symbol: meta?.meta?.symbol || short(t.mint),
+              curveAddr: await pump.bondingCurveAddress(t.mint), tokenProgram: t.tokenProgram, tokens: t.amount,
+              costLamports: -d.solDelta - d.rentDeposit, rentDeposit: d.rentDeposit, buySig: landedBuy.sig, via: 'pump.fun',
+              managed: true, source: 'auto', openedAt: landedBuy.at, peakValueLamports: 0n, state: 'open', sellAttempts: 0, nextSellAt: 0,
+            });
+            this.log('info', `Recovered the ${meta?.meta?.symbol || short(t.mint)} buy that finished while the app was closed. The bot is managing it.`, { mint: t.mint, sig: landedBuy.sig });
+            continue;
+          }
+        }
+        this.positions.set(id, {
+          id, mode: 'real', mint: t.mint, name: meta?.meta?.name || 'Coin ' + short(t.mint), symbol: meta?.meta?.symbol || short(t.mint),
+          curveAddr: await pump.bondingCurveAddress(t.mint), tokenProgram: t.tokenProgram, tokens: t.amount,
+          costLamports: 0n, found: true, managed: false, source: 'wallet', openedAt: now, peakValueLamports: 0n, state: 'open', sellAttempts: 0, nextSellAt: 0,
+        });
+        this.log('info', `Found ${meta?.meta?.symbol || short(t.mint)} in the bot wallet. It's listed under Trades; the bot won't sell it unless you tap Sell.`, { mint: t.mint });
+      }
+      for (const p of [...this.positions.values()]) {
+        if (p.mode !== 'real' || p.state === 'selling' || held.has(p.mint) || now - p.openedAt < 60_000) continue;
+        if (this._tradesBusy()) continue;
+        // only after two checks in a row, so a lagging node can't make us drop a coin we still hold
+        p.missingSeen = (p.missingSeen || 0) + 1;
+        if (p.missingSeen < 2) continue;
+        const landed = await this._landedSell(p).catch(() => null);
+        this._close(p, { proceeds: landed?.solDelta ?? null, reason: landed ? (p.sellReason || 'Sold') : 'Sold outside the bot', sig: landed?.sig || null, via: 'unknown' });
+      }
+      this._save();
+      this._ensureLoop();
+    } finally {
+      this.reconciling = false;
+      this._emit();
+    }
+  }
+
+  // ---------- numbers for the screen ----------
+
+  stats(mode = this.settings.mode) {
+    const list = this.history.filter((h) => h.mode === mode && h.pnlLamports !== null && !h.found);
+    const wins = list.filter((h) => h.pnlLamports > 0n).length;
+    const total = list.reduce((s, h) => s + BigInt(h.pnlLamports), 0n);
+    this._rollDay();
+    return { trades: list.length, wins, losses: list.length - wins, totalLamports: total, todayLamports: this.daily[mode] || 0n };
+  }
+
+  openValue(mode = this.settings.mode) {
+    return this._openPositions(mode).reduce((s, p) => s + BigInt(p.lastValueLamports ?? p.costLamports ?? 0n), 0n);
+  }
+}
