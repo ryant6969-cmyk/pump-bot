@@ -3,9 +3,9 @@
 // same signature as our own implementation (checked once per key), otherwise
 // our own implementation. Either way the result is a standard signature.
 
-import { b58decode, b58encode } from './b58.js';
-import { concat, equalBytes } from './bytes.js';
-import * as ed from './ed25519.js';
+import { b58decode, b58encode } from './b58.js?v=2.2.1';
+import { concat, equalBytes } from './bytes.js?v=2.2.1';
+import * as ed from './ed25519.js?v=2.2.1';
 
 const PKCS8_PREFIX = Uint8Array.from([
   0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,

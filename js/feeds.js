@@ -4,9 +4,9 @@
 //  2. PumpPortal's free "new token" stream.
 // Either one alone is enough. Coins are de-duplicated by mint address.
 
-import { isAddress } from './b58.js';
-import { pumpEventsFromLogs, mintAuthorityAddress } from './pump.js';
-import { ChainStream } from './rpc.js';
+import { isAddress } from './b58.js?v=2.2.1';
+import { pumpEventsFromLogs, mintAuthorityAddress } from './pump.js?v=2.2.1';
+import { ChainStream } from './rpc.js?v=2.2.1';
 
 const PUMPPORTAL_WS = 'wss://pumpportal.fun/api/data';
 

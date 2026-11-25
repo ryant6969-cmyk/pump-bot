@@ -2,17 +2,17 @@
 // and sells by its exit rules. Works the same in Practice (fake SOL, real
 // live prices) and Real mode. All state is saved on the phone.
 
-import { isAddress, b58encode } from './b58.js';
-import { Keypair } from './keys.js';
-import { associatedTokenAddress } from './pda.js';
-import * as pump from './pump.js';
-import { Rpc, ChainStream, normalizeRpcInput } from './rpc.js';
-import { CoinFeed } from './feeds.js';
-import { Trader, TradeError, readMeta } from './trader.js';
-import { DEFAULT_SETTINGS, STYLES, resolveRules, migrateSettings, evaluateScan, evaluateHolders, evaluateExit, snapAt } from './strategy.js';
-import { Tape, judge, fatalDuringStudy, flowSignals } from './analyst.js';
-import { resolveWallet, walletActivityFromLogs } from './wallets.js';
-import { fromBase64 } from './bytes.js';
+import { isAddress, b58encode } from './b58.js?v=2.2.1';
+import { Keypair } from './keys.js?v=2.2.1';
+import { associatedTokenAddress } from './pda.js?v=2.2.1';
+import * as pump from './pump.js?v=2.2.1';
+import { Rpc, ChainStream, normalizeRpcInput } from './rpc.js?v=2.2.1';
+import { CoinFeed } from './feeds.js?v=2.2.1';
+import { Trader, TradeError, readMeta } from './trader.js?v=2.2.1';
+import { DEFAULT_SETTINGS, STYLES, resolveRules, migrateSettings, evaluateScan, evaluateHolders, evaluateExit, snapAt } from './strategy.js?v=2.2.1';
+import { Tape, judge, fatalDuringStudy, flowSignals } from './analyst.js?v=2.2.1';
+import { resolveWallet, walletActivityFromLogs } from './wallets.js?v=2.2.1';
+import { fromBase64 } from './bytes.js?v=2.2.1';
 
 const POLL_MS = 2500;
 const MAX_WATCH = 99;

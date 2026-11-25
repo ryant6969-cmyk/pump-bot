@@ -13,7 +13,7 @@ function bundle() {
   for (const name of ORDER) {
     let src = fs.readFileSync(path.join(ROOT, 'js', name + '.js'), 'utf8');
     const imports = [];
-    src = src.replace(/^import\s+([\s\S]+?)\s+from\s+'\.\/(\w+)\.js';\s*$/gm, (_, what, mod) => {
+    src = src.replace(/^import\s+([\s\S]+?)\s+from\s+'\.\/(\w+)\.js(?:\?v=[^']*)?';\s*$/gm, (_, what, mod) => {
       if (!ORDER.includes(mod)) throw new Error('unknown module ' + mod);
       what = what.trim();
       if (what.startsWith('* as ')) imports.push(`const ${what.slice(5).trim()} = __m_${mod};`);
@@ -39,11 +39,11 @@ html = html
   .replace(/<link rel="manifest"[^>]*>\n?\s*/, '')
   .replace(/<link rel="icon"[^>]*>/, `<link rel="icon" type="image/png" href="${dataUri('icons/icon-192.png')}">`)
   .replace(/<link rel="apple-touch-icon"[^>]*>/, `<link rel="apple-touch-icon" href="${dataUri('icons/apple-touch-icon.png')}">`)
-  .replace(/<link rel="stylesheet" href="css\/app.css">/, () => `<style>\n${css}\n</style>`)
-  .replace(/<script src="js\/boot.js"><\/script>\n?\s*/, '')
-  .replace(/<script type="module" src="js\/main.js"><\/script>/, () => `<script>\n${js}\n</script>`)
+  .replace(/<link rel="stylesheet" href="css\/app.css(?:\?v=[^"]*)?">/, () => `<style>\n${css}\n</style>`)
+  .replace(/<script src="js\/boot.js(?:\?v=[^"]*)?"><\/script>\n?\s*/, '')
+  .replace(/<script type="module" src="js\/main.js(?:\?v=[^"]*)?"><\/script>/, () => `<script>\n${js}\n</script>`)
   .replace("script-src 'self'", `script-src 'sha256-${hash}'`);
-if (!html.includes(`'sha256-${hash}'`) || html.includes('src="js/main.js"') || html.includes('js/boot.js')) throw new Error('build failed');
+if (!html.includes(`'sha256-${hash}'`) || html.includes('js/main.js') || html.includes('js/boot.js') || html.includes('css/app.css')) throw new Error('build failed');
 fs.mkdirSync(path.join(ROOT, 'dist'), { recursive: true });
 fs.writeFileSync(path.join(ROOT, 'dist/win-bot.html'), html);
 console.log('dist/win-bot.html', (html.length / 1024).toFixed(0) + ' KB');

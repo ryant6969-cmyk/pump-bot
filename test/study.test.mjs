@@ -281,9 +281,14 @@ test('dollars: the SOL price comes from the chain when price websites are blocke
   assert.equal(bot._usd(-1_500_000_000n), ' (−$213.75)');
 });
 
-test('the version the app reports matches version.json (what the updater compares)', async () => {
+test('one release, one version: version.json, the app, the page and every import match', async () => {
   const fs = await import('node:fs');
-  const main = fs.readFileSync(new URL('../js/main.js', import.meta.url), 'utf8');
-  const v = JSON.parse(fs.readFileSync(new URL('../version.json', import.meta.url), 'utf8')).version;
-  assert.equal(main.match(/const VERSION = '([^']+)'/)[1], v);
+  const read = (f) => fs.readFileSync(new URL('../' + f, import.meta.url), 'utf8');
+  const v = JSON.parse(read('version.json')).version;
+  assert.equal(read('js/main.js').match(/const VERSION = '([^']+)'/)[1], v);
+  const html = read('index.html');
+  for (const f of ['css/app.css', 'js/boot.js', 'js/main.js']) assert.ok(html.includes(`${f}?v=${v}`), f + ' in index.html');
+  for (const f of fs.readdirSync(new URL('../js/', import.meta.url))) {
+    for (const m of read('js/' + f).matchAll(/from '\.\/(\w+)\.js([^']*)'/g)) assert.equal(m[2], '?v=' + v, `${f} imports ${m[1]}.js${m[2]}`);
+  }
 });

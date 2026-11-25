@@ -2,8 +2,8 @@
 // (an address, a pump.fun profile link, or an @username) into a wallet
 // address, and reading a wallet's pump.fun trades out of a transaction.
 
-import { isAddress } from './b58.js';
-import { pumpEventsFromLogs } from './pump.js';
+import { isAddress } from './b58.js?v=2.2.1';
+import { pumpEventsFromLogs } from './pump.js?v=2.2.1';
 
 const USER_API = 'https://frontend-api-v3.pump.fun/users/';
 

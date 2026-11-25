@@ -5,14 +5,14 @@
 //      tokens would change; refuse to sign if anything looks wrong
 //   4. sign, send, re-send until confirmed, then read the exact result.
 
-import { fromBase64, readU32, readU64, toBase64 } from './bytes.js';
-import { associatedTokenAddress } from './pda.js';
-import * as pump from './pump.js';
+import { fromBase64, readU32, readU64, toBase64 } from './bytes.js?v=2.2.1';
+import { associatedTokenAddress } from './pda.js?v=2.2.1';
+import * as pump from './pump.js?v=2.2.1';
 import {
   buildLegacyTransaction, parseTransaction, signTransaction, transactionId,
   setComputeUnitLimit, setComputeUnitPrice, systemTransfer, SYSTEM_PROGRAM, COMPUTE_BUDGET_PROGRAM,
-} from './tx.js';
-import { SPEEDS } from './strategy.js';
+} from './tx.js?v=2.2.1';
+import { SPEEDS } from './strategy.js?v=2.2.1';
 
 const PUMPPORTAL_TRADE = 'https://pumpportal.fun/api/trade-local';
 const MEMO_PROGRAM = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr';

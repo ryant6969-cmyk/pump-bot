@@ -2,11 +2,11 @@
 // keeps the screen awake while the bot works, and catches up after the app
 // returns from the background.
 
-import { Store, requestPersistentStorage } from './store.js';
-import { Bot } from './bot.js';
-import { UI, esc } from './ui.js';
+import { Store, requestPersistentStorage } from './store.js?v=2.2.1';
+import { Bot } from './bot.js?v=2.2.1';
+import { UI, esc } from './ui.js?v=2.2.1';
 
-const VERSION = '2.2.0';
+const VERSION = '2.2.1';
 
 class WakeLock {
   constructor(onChange) { this.lock = null; this.onChange = onChange; }
@@ -59,28 +59,31 @@ function makeUpdater(bot, ui, store, swReady) {
       const r = await fetch('version.json?t=' + Date.now(), { cache: 'no-store' });
       if (!r.ok) return;
       const latest = String((await r.json())?.version || '');
-      if (!latest || latest === VERSION || offered === latest) return;
+      if (!latest || latest === VERSION) return;
       const busy = bot.draining || bot.buyInFlight || [...bot.positions.values()].some((p) => p.state === 'selling');
-      // never loop: reload by itself at most once per new version
+      if (busy) { setTimeout(check, 15000); return; } // never in the middle of a trade
+      // never loop: reload by itself at most once per new version; after that, offer a button
       const tried = store.load('updateTried', null);
       const triedRecently = tried && tried.v === latest && Date.now() - tried.at < 10 * 60_000;
-      if (!bot.running && !bot.positions.size && !busy && !triedRecently) {
+      if (!triedRecently) {
         store.save('updateTried', { v: latest, at: Date.now() });
         ui.toast('Updating Win Bot…');
         setTimeout(reloadNow, 800);
         return;
       }
+      if (offered === latest) return;
       offered = latest;
       ui.offerUpdate(latest, async () => {
         for (let i = 0; i < 40 && (bot.draining || bot.buyInFlight || [...bot.positions.values()].some((p) => p.state === 'selling')); i++) await new Promise((res) => setTimeout(res, 250));
+        store.save('updateTried', null);
         await reloadNow();
       });
     } catch { /* offline: try later */ } finally {
       checking = false;
     }
   };
-  setTimeout(check, 4000);
-  setInterval(check, 5 * 60_000);
+  setTimeout(check, 3000);
+  setInterval(check, 2 * 60_000);
   return check;
 }
 

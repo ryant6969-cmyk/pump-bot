@@ -2,10 +2,10 @@
 // and the trade instructions (bonding curve v3 and PumpSwap v2), following
 // github.com/pump-fun/pump-public-docs (IDL as of November 2026).
 
-import { b58encode, isAddress } from './b58.js';
-import { concat, fromBase64, readI128, readI64, readU32, readU64, textDecoder, u64le } from './bytes.js';
-import { associatedTokenAddress, pda, toBytes } from './pda.js';
-import { SYSTEM_PROGRAM } from './tx.js';
+import { b58encode, isAddress } from './b58.js?v=2.2.1';
+import { concat, fromBase64, readI128, readI64, readU32, readU64, textDecoder, u64le } from './bytes.js?v=2.2.1';
+import { associatedTokenAddress, pda, toBytes } from './pda.js?v=2.2.1';
+import { SYSTEM_PROGRAM } from './tx.js?v=2.2.1';
 
 export const PUMP = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
 export const PUMP_AMM = 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA';

@@ -1,9 +1,9 @@
 // Everything on screen. Plain DOM, no framework. Every value that comes from
 // the network or a coin (names, symbols, errors) is escaped before display.
 
-import * as pump from './pump.js';
-import { STYLES, SPEEDS, resolveRules } from './strategy.js';
-import { isAddress } from './b58.js';
+import * as pump from './pump.js?v=2.2.1';
+import { STYLES, SPEEDS, resolveRules } from './strategy.js?v=2.2.1';
+import { isAddress } from './b58.js?v=2.2.1';
 
 export function esc(v) {
   return String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -224,7 +224,7 @@ export class UI {
     const needAwake = b.running || openPos.length > 0;
     patch(el, `
       <div class="bar">
-        <div class="brand">Win Bot<small>pump.fun trading desk</small></div>
+        <div class="brand">Win Bot<small>pump.fun trading desk · v${esc(this.version)}</small></div>
         <button class="pill mode" data-action="mode-sheet">${real ? 'REAL' : 'PRACTICE'}</button>
       </div>
       ${this.homeBanners()}

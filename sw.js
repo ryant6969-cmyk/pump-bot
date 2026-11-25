@@ -15,7 +15,7 @@ self.addEventListener('fetch', (e) => {
     try {
       const res = await fetch(req.url, { cache: 'no-store', credentials: 'same-origin' });
       if (res.redirected) return fetch(req); // let the browser follow redirects itself
-      if (res.ok && !url.search) {
+      if (res.ok && !url.pathname.endsWith('/version.json')) {
         try { const c = await caches.open(CACHE); await c.put(req.url, res.clone()); } catch { /* storage full: fine */ }
       }
       return res;
