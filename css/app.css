@@ -241,7 +241,8 @@ button.item:active, .tap:active { background: var(--card2); }
 .spark.flat polyline { stroke: var(--muted2); }
 .rail { flex: 1; height: 4px; border-radius: 3px; background: var(--card3); overflow: hidden; min-width: 40px; }
 .rail i { display: block; height: 100%; border-radius: 3px; background: var(--gold-grad); }
-.change { font-size: 12.5px; font-weight: 650; }
+.change { font-size: 12.5px; font-weight: 650; white-space: nowrap; }
+.coin .meta .badge, .coin .meta .stage { white-space: nowrap; flex: none; }
 .stage { font-size: 10.5px; font-weight: 750; letter-spacing: 0.06em; padding: 2px 6px; border-radius: 6px; text-transform: uppercase; background: var(--card3); color: var(--muted); }
 .stage.study { background: var(--gold-soft); color: var(--gold-deep); }
 .stage.pass, .stage.bought { background: var(--green-dim); color: var(--green); }

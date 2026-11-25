@@ -43,6 +43,8 @@ const DISC = {
   ammSellV2: [93, 246, 130, 60, 231, 233, 64, 178],
   createEvent: [27, 114, 169, 77, 222, 235, 99, 118],
   tradeEvent: [189, 219, 127, 211, 78, 230, 97, 238],
+  ammBuyEvent: [103, 244, 82, 31, 44, 245, 119, 119],
+  ammSellEvent: [62, 47, 55, 10, 165, 3, 220, 42],
 };
 
 // Standard pump.fun curve: 1,073,000,000 virtual tokens, 30 virtual SOL,
@@ -443,19 +445,44 @@ export function decodeTradeEvent(bytes) {
 }
 
 /**
- * pump.fun events in a transaction's logs: { creates, trades }. Only
+ * A PumpSwap BuyEvent / SellEvent (a trade on a graduated coin's pool).
+ * userBaseBefore is the trader's coin balance before the trade.
+ */
+export function decodeAmmTradeEvent(bytes) {
+  const isBuy = hasDisc(bytes, DISC.ammBuyEvent);
+  if ((!isBuy && !hasDisc(bytes, DISC.ammSellEvent)) || bytes.length < 184) return null;
+  return {
+    venue: 'pumpswap', isBuy,
+    baseAmount: readU64(bytes, 16),
+    userBaseBefore: readU64(bytes, 32),
+    solAmount: readU64(bytes, 112), // what the trader paid or got, fees included
+    pool: addr(bytes, 120),
+    user: addr(bytes, 152),
+  };
+}
+
+/**
+ * pump.fun events in a transaction's logs: { creates, trades, amm }. Only
  * "Program data" lines emitted directly by the pump program count, so another
  * program in the same transaction can't fake one.
  */
 export function pumpEventsFromLogs(logs) {
   const creates = [];
   const trades = [];
+  const amm = [];
   const stack = [];
   for (const line of logs || []) {
     if (typeof line !== 'string') continue;
     let m;
     if ((m = /^Program (\w+) invoke \[\d+\]$/.exec(line))) { stack.push(m[1]); continue; }
     if ((m = /^Program (\w+) (success|failed)/.exec(line))) { if (stack[stack.length - 1] === m[1]) stack.pop(); continue; }
+    if (line.startsWith('Program data: ') && stack[stack.length - 1] === PUMP_AMM) {
+      let bytes;
+      try { bytes = fromBase64(line.slice(14).trim()); } catch { continue; }
+      const ev = decodeAmmTradeEvent(bytes);
+      if (ev) amm.push(ev);
+      continue;
+    }
     if (line.startsWith('Program data: ') && stack[stack.length - 1] === PUMP) {
       let bytes;
       try { bytes = fromBase64(line.slice(14).trim()); } catch { continue; }
@@ -468,7 +495,7 @@ export function pumpEventsFromLogs(logs) {
       }
     }
   }
-  return { creates, trades };
+  return { creates, trades, amm };
 }
 
 export function createEventsFromLogs(logs) {

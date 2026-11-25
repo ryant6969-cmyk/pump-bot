@@ -6,7 +6,7 @@ import { Store, requestPersistentStorage } from './store.js';
 import { Bot } from './bot.js';
 import { UI, esc } from './ui.js';
 
-const VERSION = '2.1.0';
+const VERSION = '2.2.0';
 
 class WakeLock {
   constructor(onChange) { this.lock = null; this.onChange = onChange; }

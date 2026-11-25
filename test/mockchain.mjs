@@ -122,6 +122,19 @@ export function encodeTradeEvent(e) {
   );
 }
 
+/** A PumpSwap BuyEvent / SellEvent with the fields the app reads (the rest zero). */
+export function encodeAmmTradeEvent({ isBuy, baseAmount, userBaseBefore, solAmount, pool, user }) {
+  const d = new Uint8Array(420);
+  d.set(isBuy ? [103, 244, 82, 31, 44, 245, 119, 119] : [62, 47, 55, 10, 165, 3, 220, 42], 0);
+  const v = new DataView(d.buffer);
+  v.setBigUint64(16, BigInt(baseAmount), true);
+  v.setBigUint64(32, BigInt(userBaseBefore), true);
+  v.setBigUint64(112, BigInt(solAmount), true);
+  d.set(b58decode(pool), 120);
+  d.set(b58decode(user), 152);
+  return d;
+}
+
 /** Transaction logs that carry pump.fun events, emitted the way the program emits them. */
 export function pumpLogs(events, { program = pump.PUMP } = {}) {
   const lines = [`Program ${program} invoke [1]`, 'Program log: Instruction: Trade'];

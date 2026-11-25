@@ -9,9 +9,9 @@ import * as pump from './pump.js';
 import { Rpc, ChainStream, normalizeRpcInput } from './rpc.js';
 import { CoinFeed } from './feeds.js';
 import { Trader, TradeError, readMeta } from './trader.js';
-import { DEFAULT_SETTINGS, STYLES, resolveRules, migrateSettings, evaluateScan, evaluateHolders, evaluateExit } from './strategy.js';
+import { DEFAULT_SETTINGS, STYLES, resolveRules, migrateSettings, evaluateScan, evaluateHolders, evaluateExit, snapAt } from './strategy.js';
 import { Tape, judge, fatalDuringStudy, flowSignals } from './analyst.js';
-import { resolveWallet, walletTradesFromLogs } from './wallets.js';
+import { resolveWallet, walletActivityFromLogs } from './wallets.js';
 import { fromBase64 } from './bytes.js';
 
 const POLL_MS = 2500;
@@ -539,7 +539,8 @@ export class Bot extends EventTarget {
     for (const [addr, info] of want) {
       if (this.watches.has(addr)) continue;
       const handler = info.kind === 'curve' ? (sig, logs) => this._onCurveLogs(info.mint, sig, logs) : (sig, logs) => this._onWalletLogs(info.address, sig, logs);
-      this.watches.set(addr, { ...info, unsub: this.stream.subscribe(addr, handler) });
+      // tracked wallets: hear about their trades the moment they're processed, to copy them as fast as possible
+      this.watches.set(addr, { ...info, unsub: this.stream.subscribe(addr, handler, { commitment: info.kind === 'wallet' ? 'processed' : 'confirmed' }) });
     }
     const needed = this.running || want.size > 0;
     if (needed && this.stream.stopped) this.stream.start();
@@ -723,9 +724,13 @@ export class Bot extends EventTarget {
     const last = c.snaps[c.snaps.length - 1];
     const recent = c.snaps.filter((x) => x.t >= now - 120_000);
     const peak = recent.length ? Math.max(...recent.map((x) => x.mcap)) : 0;
+    // the last minute of price checks, so a short study still sees the bigger picture
+    const ref = last ? snapAt(c.snaps, last.t - 60_000) : null;
     return judge({
-      tape: this._tape(c.mint), studyStart: c.studyStart, now, coin: c, curve: c.curve || {},
+      tape: this._tape(c.mint), studyStart: c.studyStart, studyMs: (c.studyEnd || now) - c.studyStart, now, coin: c, curve: c.curve || {},
       solRaised: last?.sol, vsLaunch: last?.vsl, progress: last?.progress, peakMcap2m: peak, mcap: last?.mcap,
+      inflow60: last && ref && ref !== last ? last.sol - ref.sol : undefined,
+      rise60: last && ref && ref !== last && ref.mcap > 0 ? last.mcap / ref.mcap - 1 : undefined,
       rules, pickiness: this.pickiness(), creatorSoldBefore: c.creatorSoldBefore,
     });
   }
@@ -879,7 +884,7 @@ export class Bot extends EventTarget {
     }
   }
 
-  async _buy(mint, sol, source, extra = {}) {
+  async _buy(mint, sol, source, extra = {}, opts = {}) {
     const mode = this.settings.mode;
     const id = mode + ':' + mint;
     const rules = this.rules();
@@ -897,6 +902,10 @@ export class Bot extends EventTarget {
         if (!c) throw new TradeError("This isn't a pump.fun coin.", { kind: 'unsupported' });
         if (c.complete) throw new TradeError('This coin already graduated. The bot only buys coins still on pump.fun.', { kind: 'unsupported' });
         if (!pump.isSolPaired(c) || c.isCashbackCoin) throw new TradeError("This coin type can't be traded by the bot.", { kind: 'unsupported' });
+        if (opts.maxPrice && c.virtualTokenReserves > 0n) {
+          const now = Number(c.virtualQuoteReserves) / Number(c.virtualTokenReserves);
+          if (now > opts.maxPrice) throw new TradeError(opts.refPrice ? `the price is already up ${Math.round((now / opts.refPrice - 1) * 100)}% since they bought` : 'the price ran away', { kind: 'skipped' });
+        }
         const tokens = (pump.curveBuyTokensOut(c, lamports) * PRACTICE_SLIPPAGE) / 100n;
         if (tokens <= 0n) throw new TradeError('Nothing left to buy on this coin.', { kind: 'unsupported' });
         const cost = lamports + PRACTICE_FEE;
@@ -905,7 +914,7 @@ export class Bot extends EventTarget {
         name = name || st.meta?.name; symbol = symbol || st.meta?.symbol;
         pos = { tokens, costLamports: cost, tokenProgram: st.tokenProgram, via: 'practice', buySig: null, mayhem: !!c.isMayhemMode, creator: c.creator };
       } else {
-        const r = await this._queueTrade(() => this.trader.buy({ mint, lamports, slippagePct: rules.buySlippagePct, speed: rules.speed }), 'buy');
+        const r = await this._queueTrade(() => this.trader.buy({ mint, lamports, slippagePct: rules.buySlippagePct, speed: rules.speed, maxPrice: opts.maxPrice || null, refPrice: opts.refPrice || null }), 'buy');
         let tokens = r.tokDelta;
         if (tokens === null) {
           // landed, but the exact amounts couldn't be read: use the wallet's balance
@@ -948,8 +957,9 @@ export class Bot extends EventTarget {
     } catch (e) {
       // Allow another try only when we know nothing was bought.
       // ('expired' is not on this list: a lagging node could have hidden a buy that did land)
-      const nothingBought = !e?.uncertain && ((e?.name === 'RpcError' && !e?.sent) || (e instanceof TradeError && (e.kind === 'slippage' || (e.kind === 'network' && !e.sent))));
+      const nothingBought = !e?.uncertain && ((e?.name === 'RpcError' && !e?.sent) || (e instanceof TradeError && (e.kind === 'slippage' || e.kind === 'skipped' || (e.kind === 'network' && !e.sent))));
       if (nothingBought) this.bought.delete(id);
+      if (e?.kind === 'skipped') throw e; // a deliberate skip (copy trading), not a failure
       if (mode === 'real' && source === 'auto' && e?.kind !== 'unsupported') {
         this.failStreak++;
         if (this.failStreak >= 3) {
@@ -1383,11 +1393,11 @@ export class Bot extends EventTarget {
         const tx = await this.rpc.call('getTransaction', [x.signature, { encoding: 'json', commitment: 'confirmed', maxSupportedTransactionVersion: 1 }]).catch(() => null);
         w.seen.add(x.signature);
         if (!tx?.meta || tx.meta.err) continue;
-        const trades = walletTradesFromLogs(tx.meta.logMessages, address);
-        if (!trades.length) continue;
+        const act = walletActivityFromLogs(tx.meta.logMessages, address);
+        if (!act.trades.length && !act.amm.length) continue;
         const at = x.blockTime ? x.blockTime * 1000 : this.now();
         // copy buys only if they're fresh; copy sells always (so you're never left holding)
-        this._walletTrades(w, x.signature, trades, at, { copyBuys: !initial && this.now() - at < 30_000, copySells: !initial });
+        this._walletTrades(w, x.signature, act, at, { copyBuys: !initial && this.now() - at < 30_000, copySells: !initial });
       }
       w.lastCheckedAt = this.now();
     } finally {
@@ -1400,15 +1410,16 @@ export class Bot extends EventTarget {
   _onWalletLogs(address, sig, logs) {
     const w = this.wallets.find((x) => x.address === address);
     if (!w || w.seen.has(sig)) return;
-    const trades = walletTradesFromLogs(logs, address);
+    const act = walletActivityFromLogs(logs, address);
     w.seen.add(sig);
-    if (!trades.length) return;
-    this._walletTrades(w, sig, trades, this.now(), { copyBuys: true, copySells: true });
+    if (!act.trades.length && !act.amm.length) return;
+    this._walletTrades(w, sig, act, this.now(), { copyBuys: true, copySells: true });
     this._saveWallets();
     this._emit();
   }
 
-  _walletTrades(w, sig, trades, at, { copyBuys, copySells }) {
+  _walletTrades(w, sig, { trades = [], amm = [] }, at, { copyBuys, copySells }) {
+    for (const ev of amm) this._walletAmmTrade(w, sig, ev, at, { copySells });
     for (const ev of trades) {
       const before = BigInt(w.holdings[ev.mint] || 0n);
       w.holdings[ev.mint] = ev.isBuy ? before + ev.tokenAmount : before > ev.tokenAmount ? before - ev.tokenAmount : 0n;
@@ -1421,6 +1432,41 @@ export class Bot extends EventTarget {
       if (ev.isBuy && copyBuys && w.copy) this._copyBuy(w, ev, entry).catch(() => {});
       if (!ev.isBuy && copySells) this._copySell(w, ev, before, entry);
     }
+  }
+
+  /** A tracked wallet traded a graduated coin on PumpSwap. */
+  _walletAmmTrade(w, sig, ev, at, { copySells }) {
+    const entry = { sig, mint: null, pool: ev.pool, buy: ev.isBuy, sol: Number(ev.solAmount) / 1e9, t: at, symbol: null, name: null, note: ev.isBuy ? 'On PumpSwap: not copied (the bot buys pump.fun coins only)' : null };
+    w.trades.unshift(entry);
+    if (w.trades.length > 40) w.trades.length = 40;
+    w.lastTradeAt = Math.max(w.lastTradeAt || 0, at);
+    this._poolMint(ev.pool).then((mint) => {
+      if (!mint) return;
+      entry.mint = mint;
+      const meta = this._meta(mint);
+      if (meta) { entry.symbol = meta.symbol; entry.name = meta.name; }
+      if (!ev.isBuy && copySells) {
+        const fraction = ev.userBaseBefore > 0n ? Number(ev.baseAmount) / Number(ev.userBaseBefore) : 1;
+        if (this._followSell(w, mint, fraction)) entry.note = 'Copied the sell';
+      }
+      this._emit();
+    }).catch(() => {});
+  }
+
+  /** Which coin a PumpSwap pool trades (cached; every pump.fun pool is the coin's canonical pool). */
+  async _poolMint(pool) {
+    this.poolMints ||= new Map();
+    if (this.poolMints.has(pool)) return this.poolMints.get(pool);
+    for (const p of this.positions.values()) {
+      if (await pump.canonicalPoolAddress(p.mint) === pool) { this.poolMints.set(pool, p.mint); return p.mint; }
+    }
+    if (!this.rpc) return null;
+    const r = await this.rpc.call('getMultipleAccounts', [[pool], { encoding: 'base64', commitment: 'confirmed' }]);
+    const a = r?.value?.[0];
+    const ps = a && a.owner === pump.PUMP_AMM ? pump.decodePool(fromBase64(a.data[0])) : null;
+    const mint = ps ? ps.baseMint : null;
+    if (mint) this.poolMints.set(pool, mint);
+    return mint;
   }
 
   /** Name and symbol of a coin for the tracker (looked up once, in the background). */
@@ -1446,30 +1492,23 @@ export class Bot extends EventTarget {
     const mode = this.settings.mode;
     const id = mode + ':' + ev.mint;
     const who = this.walletLabel(w.address);
-    const skip = (why) => { entry.note = 'Not copied: ' + why; this.log('skip', `Didn't copy ${who}'s buy of ${entry.symbol || short(ev.mint)}: ${why}.`, { mint: ev.mint }); };
-    if (!this.running) return skip('the bot is stopped');
+    const skip = (why) => { entry.note = 'Not copied: ' + why; this.log('skip', `Didn't copy ${who}'s buy of ${entry.symbol || short(ev.mint)}: ${why}.`, { mint: ev.mint }); this._emit(); };
     if (!this.wallet || !this.rpc) return skip('finish setup first');
     if (this.positions.has(id) || this.buying.has(ev.mint)) return skip('you already hold it');
     if (ev.solPaired === false) return skip("it isn't a SOL coin");
     if (Number(ev.solAmount) / 1e9 < w.minLeaderSol) return skip('their buy was tiny');
+    if (ev.realTokenReserves === 0n) return skip('it just graduated');
     const rules = this.rules();
     if (-pump.lamportsToSol(this.daily[mode] || 0n) >= rules.dailyLossSol) return skip("today's loss limit is reached");
     if (this._openPositions(mode).filter((p) => p.copiedFrom).length >= MAX_COPY_OPEN) return skip(`${MAX_COPY_OPEN} copied trades are already open`);
     const need = pump.solToLamports(w.copySol + (mode === 'real' ? rules.keepSolReserve + FEE_BUFFER_SOL : 0.001));
     if (this.availableLamports(mode) < need) return skip('not enough SOL');
-    this.buying.add(ev.mint); // claim it before anything async
+    // don't chase: skip if the price ran more than 25% past what they paid (checked inside the buy, no extra wait)
+    const theirs = Number(ev.virtualSolReserves) / Number(ev.virtualTokenReserves);
     entry.note = 'Copying…';
     this._emit();
     try {
-      const st = await this._readCoin(ev.mint).catch(() => null);
-      if (!st?.curve) return skip("couldn't read the coin");
-      if (st.curve.complete) return skip('it already graduated');
-      // don't chase: skip if the price ran far past what they paid
-      const theirs = Number(ev.virtualSolReserves) / Number(ev.virtualTokenReserves);
-      const now = Number(st.curve.virtualQuoteReserves) / Number(st.curve.virtualTokenReserves);
-      if (theirs > 0 && now > theirs * 1.25) return skip(`the price is already up ${Math.round((now / theirs - 1) * 100)}% since they bought`);
-      this.buying.delete(ev.mint);
-      const p = await this._buy(ev.mint, w.copySol, 'copy', { copiedFrom: w.address, mayhem: !!st.curve.isMayhemMode, creator: st.curve.creator });
+      const p = await this._buy(ev.mint, w.copySol, 'copy', { copiedFrom: w.address, creator: ev.creator || null }, { maxPrice: theirs > 0 ? theirs * 1.25 : null, refPrice: theirs > 0 ? theirs : null });
       entry.note = 'Copied';
       // they already sold everything while our buy was landing: don't get left holding it
       if (p && !(BigInt(w.holdings[ev.mint] || 0n) > 0n) && this.positions.get(p.id) === p) {
@@ -1478,20 +1517,26 @@ export class Bot extends EventTarget {
         this._sell(p, p.sellRequested);
       }
     } catch (e) {
-      entry.note = 'Copy failed: ' + (e.message || 'error');
+      if (e?.kind === 'skipped') skip(e.message);
+      else entry.note = 'Copy failed: ' + (e.message || 'error');
     } finally {
-      this.buying.delete(ev.mint);
       this._saveWallets();
       this._emit();
     }
   }
 
   _copySell(w, ev, theirBefore, entry) {
+    const fraction = theirBefore > 0n ? Number(ev.tokenAmount) / Number(theirBefore) : 1;
+    if (this._followSell(w, ev.mint, fraction)) entry.note = 'Copied the sell';
+  }
+
+  /** Sell the same share of our copied position as they just sold. Returns true if there was one. */
+  _followSell(w, mint, fraction) {
+    let hit = false;
     for (const p of this.positions.values()) {
-      if (p.mint !== ev.mint || p.copiedFrom !== w.address) continue;
-      const fraction = theirBefore > 0n ? Number(ev.tokenAmount) / Number(theirBefore) : 1;
+      if (p.mint !== mint || p.copiedFrom !== w.address) continue;
+      hit = true;
       const who = this.walletLabel(w.address);
-      entry.note = 'Copied the sell';
       if (fraction >= 0.9) {
         p.sellRequested = `${who} sold`;
         p.nextSellAt = 0;
@@ -1501,6 +1546,7 @@ export class Bot extends EventTarget {
       }
       this._ensureLoop();
     }
+    return hit;
   }
 
   // ---------- numbers for the screen ----------

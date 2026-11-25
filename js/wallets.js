@@ -61,3 +61,9 @@ export async function resolveWallet(text, fetchImpl) {
 export function walletTradesFromLogs(logs, wallet) {
   return pumpEventsFromLogs(logs).trades.filter((t) => t.user === wallet);
 }
+
+/** Everything `wallet` traded in a transaction: curve trades and PumpSwap trades. */
+export function walletActivityFromLogs(logs, wallet) {
+  const ev = pumpEventsFromLogs(logs);
+  return { trades: ev.trades.filter((t) => t.user === wallet), amm: ev.amm.filter((t) => t.user === wallet) };
+}

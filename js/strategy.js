@@ -50,7 +50,7 @@ export const SPEEDS = {
   turbo: { label: 'Turbo', microLamports: 3_000_000, maxMicroLamports: 6_000_000 },
 };
 
-export const SETTINGS_VERSION = 3;
+export const SETTINGS_VERSION = 4;
 
 // Settings the user can change; anything left null uses the style's value.
 export const DEFAULT_SETTINGS = {
@@ -63,8 +63,8 @@ export const DEFAULT_SETTINGS = {
   trailStartPct: null, trailDropPct: null, maxHoldMin: null, dailyLossSol: null,
   sellBeforeGraduation: true,
   skipMayhem: false, // mayhem coins are allowed, with stricter checks
-  studySec: 45,
-  mayhemStudySec: 25,
+  studySec: 10,
+  mayhemStudySec: 10,
   mayhemProfitMinUsd: 5,
   mayhemProfitMaxUsd: 10,
   keepSolReserve: 0.01,
@@ -83,6 +83,10 @@ export function migrateSettings(s) {
   const v = Number(out.settingsVersion) || 1;
   if (v < 2) out.skipMayhem = false; // v2: mayhem coins allowed, but only when the study says they're flying
   if (v < 3 && out.setupDone) out.pendingPracticeUsd = (Number(out.pendingPracticeUsd) || 0) + 500; // v3: a one-time $500 practice top-up
+  if (v < 4) { // v4: 10-second studies (keeps a time the user picked themselves)
+    if (out.studySec === undefined || Number(out.studySec) === 45) out.studySec = 10;
+    if (out.mayhemStudySec === undefined || Number(out.mayhemStudySec) === 25) out.mayhemStudySec = 10;
+  }
   out.settingsVersion = SETTINGS_VERSION;
   return out;
 }
@@ -103,8 +107,8 @@ export function resolveRules(settings) {
   r.speed = SPEEDS[settings.speed] ? settings.speed : 'fast';
   r.keepSolReserve = Math.max(0.005, Number(settings.keepSolReserve) || 0.01);
   const num = (v, d, lo, hi) => (Number.isFinite(Number(v)) && v !== null && v !== '' ? Math.min(hi, Math.max(lo, Number(v))) : d);
-  r.studySec = num(settings.studySec, 45, 15, 180);
-  r.mayhemStudySec = num(settings.mayhemStudySec, 25, 10, 120);
+  r.studySec = num(settings.studySec, 10, 5, 180);
+  r.mayhemStudySec = num(settings.mayhemStudySec, 10, 5, 120);
   r.mayhemProfitMinUsd = num(settings.mayhemProfitMinUsd, 5, 0.5, 10000);
   r.mayhemProfitMaxUsd = Math.max(r.mayhemProfitMinUsd, num(settings.mayhemProfitMaxUsd, 10, 0.5, 10000));
   r.mayhemStrictness = 1.25;

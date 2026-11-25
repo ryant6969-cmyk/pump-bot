@@ -152,10 +152,10 @@ export class ChainStream {
   has(address) { return this.subs.has(address); }
 
   /** Watch transactions that mention `address`. Returns a function that stops watching. */
-  subscribe(address, handler, { busy = false } = {}) {
+  subscribe(address, handler, { busy = false, commitment = 'confirmed' } = {}) {
     let s = this.subs.get(address);
     if (!s) {
-      s = { handlers: new Set(), subId: null, reqId: null, busy };
+      s = { handlers: new Set(), subId: null, reqId: null, busy, commitment };
       this.subs.set(address, s);
       if (this.ws && this.wsOpen) this._sendSub(address, s);
     }
@@ -219,7 +219,7 @@ export class ChainStream {
   }
 
   _sendSub(address, s) {
-    const id = this._send('logsSubscribe', [{ mentions: [address] }, { commitment: 'confirmed' }]);
+    const id = this._send('logsSubscribe', [{ mentions: [address] }, { commitment: s.commitment || 'confirmed' }]);
     if (id !== null) { s.reqId = id; this.reqs.set(id, address); }
   }
 

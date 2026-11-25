@@ -72,7 +72,7 @@ function startMarket() {
         if (k.trend === 'moon') { await othersBuy(mint, 0.2 + Math.random() * 0.25); await othersBuy(mint, 0.15 + Math.random() * 0.2); }
         else if (k.trend === 'flat') { if (Math.random() < 0.3) await othersBuy(mint, 0.05); }
         else if (k.trend === 'rug') {
-          if (age < 22) await othersBuy(mint, 0.35);
+          if (age < 9) await othersBuy(mint, 0.35);
           else if (!k.rugged) { k.rugged = true; await trade(mint, { user: k.creator, isBuy: false }); }
           else if (Math.random() < 0.5) await othersBuy(mint, 0.05);
         } else if (k.trend === 'agent') {
@@ -211,7 +211,7 @@ async function main() {
   await shot('11-coin-sheet-studying');
   await tap('.sheet [data-action="close-sheet"]');
   await tap('[data-action="tab"][data-tab="home"]');
-  log('waiting for the practice buy (after a 45 s study)…');
+  log('waiting for the practice buy (after a 10 s study)…');
   await page.waitForFunction(() => document.querySelectorAll('[data-action="pos"]').length > 0, null, { timeout: 120_000 });
   await shot('12-home-practice-holding');
   const homeText = await page.locator('.balance').textContent();
@@ -227,6 +227,21 @@ async function main() {
   await shot('14-trades-history');
   await tap('[data-action="tab"][data-tab="coins"]');
   await shot('15-coins-studied');
+  await tap('[data-action="coin-view"][data-view="movers"]');
+  await sleep(300);
+  await shot('15b-coins-movers');
+  const movers = await page.locator('#coin-list').textContent();
+  const topMover = await page.locator('#coin-list .coin .name').first().textContent();
+  log('movers tab: top is', topMover.trim(), '| mayhem excluded:', !/Agent Only/.test(movers));
+  if (!/Rocket Dog|Whale Coin/.test(topMover) || /Agent Only/.test(movers)) errors.push('movers tab order is wrong');
+  await tap('[data-action="coin-view"][data-view="mayhem"]');
+  await sleep(300);
+  await shot('15c-coins-mayhem');
+  const may = await page.locator('#coin-list').textContent();
+  log('mayhem tab:', /Agent Only/.test(may) && !/Rocket Dog/.test(may) ? 'ok: mayhem coins only' : 'UNEXPECTED ' + may.slice(0, 200));
+  if (!/Agent Only/.test(may) || /Rocket Dog/.test(may)) errors.push('mayhem tab is wrong');
+  await tap('[data-action="coin-view"][data-view="trending"]');
+  await sleep(300);
   await tap(`[data-action="coin"][data-mint="${rug}"]`);
   await sleep(500);
   await shot('16-coin-sheet-mangy');
@@ -289,7 +304,7 @@ async function main() {
   await page.waitForFunction(() => document.querySelector('.power.on'), null, { timeout: 10_000 });
   const moon2 = await launch('Laser Frog', 'LFROG', 'moon');
   await announce(moon2);
-  log('waiting for the real buy (after a 45 s study)…');
+  log('waiting for the real buy (after a 10 s study)…');
   await page.waitForFunction(() => document.querySelectorAll('[data-action="pos"]').length > 0, null, { timeout: 120_000 });
   await shot('23-home-real-holding');
   const { associatedTokenAddress } = await import('../js/pda.js');

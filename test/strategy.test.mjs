@@ -26,10 +26,13 @@ test('settings: old saves are migrated; overrides are clamped; junk is ignored',
   assert.equal(r.maxOpen, 3);
   assert.equal(r.takeProfitPct, STYLES.balanced.takeProfitPct);
   assert.equal(r.trailDropPct, 1);
-  assert.equal(r.studySec, 15, 'never studies less than 15 s');
+  assert.equal(r.studySec, 5, 'never studies less than 5 s');
   assert.equal(r.mayhemProfitMaxUsd, 8, 'max is never below min');
-  assert.equal(rules.studySec, 45);
-  assert.equal(rules.mayhemStudySec, 25);
+  assert.equal(rules.studySec, 10);
+  assert.equal(rules.mayhemStudySec, 10);
+  assert.equal(migrateSettings({ settingsVersion: 3, studySec: 45, mayhemStudySec: 25 }).studySec, 10, 'v4: 10-second studies');
+  assert.equal(migrateSettings({ settingsVersion: 3, studySec: 45, mayhemStudySec: 25 }).mayhemStudySec, 10);
+  assert.equal(migrateSettings({ settingsVersion: 3, studySec: 30 }).studySec, 30, 'a time the user picked is kept');
   assert.deepEqual([rules.mayhemProfitMinUsd, rules.mayhemProfitMaxUsd], [5, 10]);
   assert.equal(resolveRules({ style: 'nope' }).label, 'Balanced');
 });
@@ -252,4 +255,24 @@ test('wallet input: addresses, profile links, @usernames', async () => {
   await assert.rejects(() => resolveWallet('@nobody', async () => ({ ok: false, status: 404 })), /no user called @nobody/);
   await assert.rejects(() => resolveWallet('@cupsey', async () => { throw new TypeError('Load failed'); }), /paste that instead/);
   await assert.rejects(() => resolveWallet('@cupsey', async () => ({ ok: true, status: 200, json: async () => ({ username: 'cupsey' }) })), /Paste their wallet address/);
+});
+
+test('study: a 10-second study scales the volume bars, keeps the quality bars', () => {
+  // 10 s of steady buying from 6 wallets, after a minute in which 2 SOL came in and the price rose 30%
+  const mint = addr(), creator = addr();
+  const tape = new Tape({ mint, creator });
+  const st = { vQ: 35_000_000_000n, vT: 920_000_000_000_000n, rQ: 5_000_000_000n };
+  for (let i = 0; i < 6; i++) tape.add(ev(mint, addr(), true, 0.15, st), NOW - 9_000 + i * 1500, 's' + i);
+  const short = (extra = {}) => judge({ tape, studyStart: NOW - 10_000, studyMs: 10_000, now: NOW, coin: { creator }, curve, solRaised: 6, vsLaunch: 1.4, progress: 0.1, peakMcap2m: 60, mcap: 60, rules, inflow60: 2, rise60: 0.3, ...extra });
+  const v = short();
+  assert.equal(v.ok, true, JSON.stringify(v.vetoes) + ' score ' + v.score);
+  // the same quality checks still apply
+  assert.ok(short({ inflow60: 0.1 }).vetoes.some((x) => /money/.test(x)), 'needs money over the last minute too');
+  assert.ok(short({ vsLaunch: 0.9 }).vetoes.some((x) => /launch/.test(x)));
+  assert.ok(short({ peakMcap2m: 100 }).vetoes.some((x) => /off its high/.test(x)));
+  // the same tape judged as a 45-second study needs far more buyers
+  assert.equal(judge({ tape, studyStart: NOW - 45_000, studyMs: 45_000, now: NOW, coin: { creator }, curve, solRaised: 6, vsLaunch: 1.4, progress: 0.1, peakMcap2m: 60, mcap: 60, rules }).ok, false);
+  // a creator dump is still a hard no
+  tape.add(ev(mint, creator, false, 0.6, st), NOW - 200, 'dump');
+  assert.ok(short().vetoes.includes('Creator is selling'));
 });

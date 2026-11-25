@@ -62,7 +62,7 @@ test('wallets that churn (buy, sell, buy, sell) do not count as real buyers', as
   const c = t.bot.coins.get(t.mint);
   assert.ok(c.verdict, 'it was studied');
   assert.ok(c.verdict.m.flippers >= 3, 'the churning wallets were spotted');
-  assert.match(c.status, /real buyers|money|Score/);
+  assert.match(c.status, /real buyers|money|Score|One wallet/);
 });
 
 test('sells the moment the creator starts selling a coin it holds', async () => {
@@ -157,7 +157,29 @@ test('copy trading: does not chase a coin that already ran up after their buy', 
   assert.match(t.bot.wallets[0].trades[0].note, /already up/);
 });
 
-test('copy trading: never copies while the bot is stopped, but the tracker still records', async () => {
+test('copy trading: copies right away even when the bot is not started; the tracker records it', async () => {
+  const t = await setup({ mode: 'practice' });
+  assert.equal(t.bot.running, false);
+  const leader = b58encode(nodeCrypto.randomBytes(32));
+  await t.bot.trackWallet(leader);
+  t.bot.updateWallet(leader, { copy: true });
+  await sleep(5);
+  assert.ok(TestWS.all.some((ws) => !ws.closed && ws.subs.has(leader)));
+  await t.othersBuy(1);
+  const buy = await t.chain.trade(t.mint, { user: leader, sol: 0.5 });
+  TestWS.push(leader, pumpLogs([buy]));
+  await until(() => t.bot.positions.size === 1);
+  assert.equal([...t.bot.positions.values()][0].copiedFrom, leader);
+  assert.equal(t.bot.wallets[0].trades.length, 1);
+  await assert.rejects(() => t.bot.trackWallet(leader), /already track/);
+  await assert.rejects(() => t.bot.trackWallet(t.bot.wallet.address), /own wallet/);
+  t.bot.untrackWallet(leader);
+  await sleep(5);
+  assert.equal(TestWS.watching(leader), false, 'stopped watching');
+});
+
+test('copy trading: when they sell a graduated coin on PumpSwap, the bot sells too', async () => {
+  const { encodeAmmTradeEvent } = await import('./mockchain.mjs');
   const t = await setup({ mode: 'practice' });
   const leader = b58encode(nodeCrypto.randomBytes(32));
   await t.bot.trackWallet(leader);
@@ -166,15 +188,19 @@ test('copy trading: never copies while the bot is stopped, but the tracker still
   await t.othersBuy(1);
   const buy = await t.chain.trade(t.mint, { user: leader, sol: 0.5 });
   TestWS.push(leader, pumpLogs([buy]));
-  await sleep(20);
-  assert.equal(t.bot.positions.size, 0);
-  assert.equal(t.bot.wallets[0].trades.length, 1);
-  assert.match(t.bot.wallets[0].trades[0].note, /stopped/);
-  await assert.rejects(() => t.bot.trackWallet(leader), /already track/);
-  await assert.rejects(() => t.bot.trackWallet(t.bot.wallet.address), /own wallet/);
-  t.bot.untrackWallet(leader);
-  await sleep(5);
-  assert.equal(TestWS.watching(leader), false, 'stopped watching');
+  await until(() => t.bot.positions.size === 1);
+  // the coin graduates; they sell everything on PumpSwap
+  await t.chain.setCurve(t.mint, { complete: true, realTokenReserves: 0n });
+  const pool = await t.chain.addPool({ mint: t.mint });
+  const sell = encodeAmmTradeEvent({ isBuy: false, baseAmount: buy.tokenAmount, userBaseBefore: buy.tokenAmount, solAmount: 600_000_000n, pool, user: leader });
+  TestWS.push(leader, pumpLogs([sell], { program: pump.PUMP_AMM }));
+  await until(() => t.bot.positions.size === 0);
+  assert.equal(t.bot.positions.size, 0, 'sold');
+  assert.match(t.bot.history[0].reason, /sold/);
+  const w = t.bot.wallets[0];
+  assert.equal(w.trades[0].pool, pool);
+  await until(() => w.trades[0].note === 'Copied the sell');
+  assert.equal(w.trades[0].mint, t.mint);
 });
 
 // ---------- practice money ----------

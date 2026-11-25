@@ -23,10 +23,10 @@ test('practice: buys a rising coin after the holder check, then takes profit', a
   assert.equal(pos.symbol, 'RDOG');
   const coin = t.bot.coins.get(t.mint);
   assert.ok(coin.holders.ok);
-  // it really studied the trades first: 45 s of them, and the score passed
-  assert.ok(pos.openedAt - coin.studyStart >= 45_000, 'studied for 45 s');
+  // it really studied the trades first (10 s of them) and the score passed
+  assert.ok(pos.openedAt - coin.studyStart >= 10_000, 'studied for 10 s');
   assert.ok(coin.verdict.ok && coin.verdict.score >= coin.verdict.need, JSON.stringify(coin.verdict.vetoes));
-  assert.ok(coin.verdict.m.uniqueBuyers >= 8);
+  assert.ok(coin.verdict.m.uniqueBuyers >= 5, 'real buyers: ' + coin.verdict.m.uniqueBuyers);
   assert.equal(pos.score, coin.verdict.score);
   assert.ok(t.bot.practice.balance < start);
   // the coin keeps flying -> take profit at +50%

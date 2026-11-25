@@ -157,12 +157,17 @@ export class Trader {
 
   // ---------- trades ----------
 
-  async buy({ mint, lamports, slippagePct = 15, speed = 'fast' }) {
+  /** maxPrice (SOL per raw token): don't buy if the coin already costs more than that (copy trading). */
+  async buy({ mint, lamports, slippagePct = 15, speed = 'fast', maxPrice = null, refPrice = null }) {
     lamports = BigInt(lamports);
     const user = this.wallet.address;
     const st = await this.coinState(mint);
     const c = st.curve;
     if (!c) throw new TradeError("This isn't a pump.fun coin (or it's very old).", { kind: 'unsupported' });
+    if (maxPrice && !c.complete && c.virtualTokenReserves > 0n) {
+      const now = Number(c.virtualQuoteReserves) / Number(c.virtualTokenReserves);
+      if (now > maxPrice) throw new TradeError(refPrice ? `the price is already up ${Math.round((now / refPrice - 1) * 100)}% since they bought` : 'the price ran away', { kind: 'skipped' });
+    }
     if (c.complete) throw new TradeError('This coin already graduated to PumpSwap. The bot only buys coins still on pump.fun.', { kind: 'unsupported' });
     if (!pump.isSolPaired(c) || c.depth > 0) throw new TradeError("This coin isn't paired with SOL. The bot only trades SOL coins.", { kind: 'unsupported' });
     if (c.isCashbackCoin) throw new TradeError("This coin type can't be traded by the bot.", { kind: 'unsupported' });
@@ -183,10 +188,13 @@ export class Trader {
   /** Sell `amount` raw tokens (or everything when amount is null). */
   async sell({ mint, tokenProgram, amount = null, slippagePct = 25, speed = 'fast', allowFallback = true }) {
     const user = this.wallet.address;
-    const st = await this.coinState(mint);
+    // read the coin and our token account together (one round trip) when the token program is known
+    const guessAta = tokenProgram ? await associatedTokenAddress(user, mint, tokenProgram) : null;
+    const [st, guess] = await Promise.all([this.coinState(mint), guessAta ? this.getAccounts([guessAta]) : null]);
+    const known = tokenProgram && st.tokenProgram === tokenProgram;
     tokenProgram = st.tokenProgram || tokenProgram;
-    const ata = await associatedTokenAddress(user, mint, tokenProgram);
-    const [tokAcc] = await this.getAccounts([ata]);
+    const ata = known ? guessAta : await associatedTokenAddress(user, mint, tokenProgram);
+    const [tokAcc] = known ? guess : await this.getAccounts([ata]);
     const held = tokAcc ? pump.decodeTokenAccount(tokAcc.data)?.amount ?? 0n : 0n;
     if (held <= 0n) throw new TradeError('The wallet has none of this coin left.', { kind: 'gone' });
     const qty = amount === null || BigInt(amount) > held ? held : BigInt(amount);

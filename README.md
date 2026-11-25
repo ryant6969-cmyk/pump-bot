@@ -3,7 +3,7 @@
 A pump.fun trading bot that runs on your iPhone. It's a Home Screen web app, so there's nothing to install and no server to run.
 
 - **Practice first:** it starts with pretend SOL on real live coins.
-- **It studies before it buys:** for 45 seconds it reads every trade on a promising coin (real buyers, money in and out, whales, whether the creator is selling) and scores it out of 100. Only strong coins get bought.
+- **It studies before it buys:** for 10 seconds it reads every trade on a promising coin (real buyers, money in and out, whales, whether the creator is selling), adds the last minute of price history, and scores it out of 100. Only strong coins get bought.
 - **It watches what it holds:** it sells right away if the creator starts selling, a big holder dumps, or sellers take over.
 - **Wallet tracker and copy trading:** follow any trader by wallet address, pump.fun profile link or @username, and optionally copy their trades.
 - **Your keys stay on the phone:** the bot has its own wallet, stored only on your iPhone. Trades go straight from the phone to Solana.
@@ -27,16 +27,14 @@ A pump.fun trading bot that runs on your iPhone. It's a Home Screen web app, so 
 | SOL per trade | 0.02 | 0.05 | 0.1 |
 | Trades at once | 1 | 2 | 3 |
 | Score needed to buy | 78 | 70 | 62 |
-| Real buyers needed in the study | 12 | 8 | 6 |
-| Net SOL coming in during the study | 1.5 | 1.0 | 0.6 |
-| Price rise during the study | +15% | +10% | +7% |
+| Real buyers, money and price rise needed | the most | medium | the least (all scaled to the study length) |
 | Take profit | +30% | +45% | +90% |
 | Stop loss | −15% | −18% | −25% |
 | Trailing stop | after +20%, on a 10% drop | after +25%, on a 12% drop | after +35%, on a 15% drop |
 | Time limit | 6 min | 10 min | 15 min |
 | Stops buying for the day after losing | 0.1 SOL | 0.25 SOL | 0.5 SOL |
 
-**Scans** every new coin's bonding curve and picks the ones with SOL coming in, priced above launch and not falling, for a **study**: it subscribes to the coin's live trades and reads them for 45 seconds (25 for mayhem coins). Wallets that keep buying and selling (volume bots) and pump.fun's mayhem agent don't count as real buyers.
+**Scans** every new coin's bonding curve and picks the ones with SOL coming in, priced above launch and not falling, for a **study**: it subscribes to the coin's live trades and reads them for 10 seconds (changeable in Settings), together with the last minute of price history. Wallets that keep buying and selling (volume bots) and pump.fun's mayhem agent don't count as real buyers.
 
 **Rejects** a coin if the creator is selling, there are too few real buyers, more selling than buying, too little money coming in, one wallet doing most of the buying, the price isn't climbing, it's already well off its high, it has too little SOL in it, or it isn't clearly above its launch price. Otherwise it gets a score out of 100 (real buyers 25, money in 20, buy pressure 15, momentum 15, spread 10, holding up 10, creator 5). A coin that passes then needs spread-out holders (the curve and the mayhem agent's vault excluded). After losses in a row, coins need up to 15 more points until the next win.
 
@@ -44,7 +42,9 @@ A pump.fun trading bot that runs on your iPhone. It's a Home Screen web app, so 
 
 **Sells** right away if the creator sells, a big holder dumps, or sellers take over; otherwise on take profit, stop loss, trailing stop, time limit, if the coin goes nowhere, at 95% of the curve (optional), or if it graduates to PumpSwap. Sales are retried until they land, with more slippage each time if the price is moving fast. Coins the bot didn't buy are never sold unless you tap Sell.
 
-**Copy trading** (Wallets tab): when a tracked trader buys a pump.fun coin, the bot buys your set amount of it, unless the price already ran up 25% since their buy. When they sell, it sells the same share. Copied trades keep your stop loss and the creator/dump protections; take profit and time limits are left to the trader you copy. Copies only run while the bot is started.
+**Copy trading** (Wallets tab): the bot hears about a tracked trader's trades the moment Solana processes them. When they buy a pump.fun coin, it buys your set amount right away, unless the price already ran up 25% since their buy. When they sell (on pump.fun or PumpSwap), it sells the same share. Copied trades keep your stop loss and the creator/dump protections; take profit and time limits are left to the trader you copy. Copying works whenever the app is open on screen, even if the bot isn't started.
+
+**Coins tab:** Trending (where the money is going, with the bot's scores), Movers (biggest price gains in the last 5 minutes among coins with real trading), Mayhem (mayhem coins only) and New.
 
 Every setting can be changed in the app.
 

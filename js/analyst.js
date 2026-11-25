@@ -100,9 +100,16 @@ export function judge(ctx) {
   const e = rules.entry;
   const mayhem = !!(coin.isMayhemMode || curve.isMayhemMode);
   const k = mayhem ? (rules.mayhemStrictness || 1.25) : 1; // mayhem coins must look stronger
+  // A short study sees fewer trades: volume bars scale with its length (quality bars don't).
+  // The last minute of price history (from the bot's price checks) fills in the rest.
+  const studyMs = Math.max(1000, ctx.studyMs || now - studyStart);
+  const f = Math.max(0.2, Math.min(1, studyMs / 45000));
+  const half = Math.max(5000, Math.min(15000, studyMs / 2));
   const m = measure(tape, studyStart, now);
-  const recent = measure(tape, now - 15000, now);
-  const before = measure(tape, now - 30000, now - 15000);
+  const recent = measure(tape, now - half, now);
+  const before = measure(tape, now - 2 * half, now - half);
+  const inflow60 = Number.isFinite(ctx.inflow60) ? ctx.inflow60 : null;
+  const rise60 = Number.isFinite(ctx.rise60) ? ctx.rise60 : null;
   const vetoes = [];
   const veto = (t) => vetoes.push(t);
 
@@ -113,15 +120,18 @@ export function judge(ctx) {
   const devTok = coin.devBuyTokens ? Number(coin.devBuyTokens) : 0;
   const creatorDumped = m.creatorSoldSol >= 0.5 || (devTok > 0 && m.creatorTokOut >= devTok * 0.5) || (ctx.creatorSoldBefore === true);
   if (creatorDumped) veto('Creator is selling');
-  if (m.trades < e.minTrades) veto(`Too little trading (${m.trades} trades)`);
-  const minBuyers = Math.ceil(e.minBuyers * k);
+  const minTrades = Math.max(4, Math.ceil(e.minTrades * f));
+  if (m.trades < minTrades) veto(`Too little trading (${m.trades} trades)`);
+  const minBuyers = Math.max(mayhem ? 4 : 3, Math.ceil(e.minBuyers * k * f));
   if (m.uniqueBuyers < minBuyers) veto(`Only ${m.uniqueBuyers} real buyers (needs ${minBuyers})`);
   const minRatio = mayhem ? Math.max(e.minBuyRatio, 0.62) : e.minBuyRatio;
   if (m.buyRatio < minRatio) veto('More selling than buying');
-  const minNet = e.minNetSol * k;
-  if (m.netSol < minNet) veto(`Not enough money coming in (${m.netSol.toFixed(2)} SOL)`);
+  const minNet = e.minNetSol * k * f;
+  if (m.netSol < minNet || (inflow60 !== null && inflow60 < e.minNetSol * 0.5)) veto(`Not enough money coming in (${m.netSol.toFixed(2)} SOL)`);
   if (m.buySol > 0 && m.topShare > e.maxTopShare) veto('One wallet is doing most of the buying');
-  if (m.change < (e.minRise ?? 0.1)) veto(`Price isn't climbing (${m.change >= 0 ? '+' : ''}${Math.round(m.change * 100)}% while studied)`);
+  const minRise = e.minRise ?? 0.1;
+  if (m.change < 0) veto('Price is dropping right now');
+  else if (m.change < minRise * f && (rise60 === null || rise60 < minRise)) veto(`Price isn't climbing (+${Math.round(m.change * 100)}% while studied)`);
   const dd2m = ctx.peakMcap2m > 0 && ctx.mcap > 0 ? 1 - ctx.mcap / ctx.peakMcap2m : 0;
   const drawdown = Math.max(dd2m, m.drawdown);
   if (drawdown * 100 > e.maxDrawdownPct) veto(`Already ${Math.round(drawdown * 100)}% off its high`);
@@ -132,21 +142,23 @@ export function judge(ctx) {
   if (ctx.vsLaunch !== null && ctx.vsLaunch !== undefined && ctx.vsLaunch < e.minVsLaunch) veto('Not clearly above its launch price');
   if (m.lastAt && now - m.lastAt > 15000) veto('Trading went quiet');
   if (mayhem) {
-    if (m.realTrades < Math.max(e.minTrades, 6) || m.ignoredSol > (m.buySol + m.sellSol) * 1.5) veto('Mostly the mayhem bot trading');
+    if (m.realTrades < Math.max(minTrades, 4) || m.ignoredSol > (m.buySol + m.sellSol) * 1.5) veto('Mostly the mayhem bot trading');
     // still climbing at the end, and the buying isn't fading
-    const flying = m.change >= 0.12 && recent.netSol > 0 && recent.netSol >= before.netSol * 0.8 && recent.change >= 0;
+    const climbing = m.change >= 0.12 * Math.max(f, 0.5) || (rise60 !== null && rise60 >= 0.15);
+    const flying = climbing && recent.netSol > 0 && recent.netSol >= before.netSol * 0.8 && recent.change >= 0;
     if (!flying) veto('Mayhem coin is not flying up yet');
   }
 
   // ---- score ----
   const parts = [];
-  const part = (key, label, max, f, note) => parts.push({ key, label, max, pts: Math.round(max * clamp01(f) * 10) / 10, note });
-  const lo = e.minBuyers * 0.5, hi = e.minBuyers * 2.5;
+  const part = (key, label, max, x, note) => parts.push({ key, label, max, pts: Math.round(max * clamp01(x) * 10) / 10, note });
+  const lo = e.minBuyers * 0.5 * f, hi = Math.max(lo + 2, e.minBuyers * 2.5 * f);
   part('buyers', 'Real buyers', 25, (m.uniqueBuyers - lo) / (hi - lo), `${m.uniqueBuyers} wallets`);
-  part('money', 'Money coming in', 20, m.netSol / (e.minNetSol * 3), `${m.netSol >= 0 ? '+' : ''}${m.netSol.toFixed(2)} SOL net`);
+  part('money', 'Money coming in', 20, Math.max(m.netSol / (e.minNetSol * 3 * f), (inflow60 ?? 0) / (e.minNetSol * 3)), `${m.netSol >= 0 ? '+' : ''}${m.netSol.toFixed(2)} SOL net${inflow60 !== null ? `, ${inflow60 >= 0 ? '+' : ''}${inflow60.toFixed(1)} in 1 min` : ''}`);
   part('pressure', 'Buy pressure', 15, (m.buyRatio - 0.5) / 0.35, `${Math.round(m.buyRatio * 100)}% buys`);
   const accel = recent.netSol > 0 && recent.netSol >= before.netSol * 0.9;
-  part('momentum', 'Momentum', 15, (clamp01(m.change / 0.3) * 10 + (accel ? 5 : 0)) / 15, `${m.change >= 0 ? '+' : ''}${Math.round(m.change * 100)}%${accel ? ', speeding up' : ''}`);
+  const move = Math.max(m.change / (0.3 * f), (rise60 ?? 0) / 0.3);
+  part('momentum', 'Momentum', 15, (clamp01(move) * 10 + (accel ? 5 : 0)) / 15, `${m.change >= 0 ? '+' : ''}${Math.round(m.change * 100)}%${rise60 !== null ? ` (${rise60 >= 0 ? '+' : ''}${Math.round(rise60 * 100)}% in 1 min)` : ''}${accel ? ', speeding up' : ''}`);
   part('spread', 'Spread out', 10, (0.4 - m.topShare) / 0.25, `top buyer ${Math.round(m.topShare * 100)}%`);
   part('holding', 'Holding up', 10, (0.25 - drawdown) / 0.2, drawdown > 0.005 ? `${Math.round(drawdown * 100)}% off high` : 'at its high');
   part('creator', 'Creator', 5, m.creatorSoldSol > 0.05 ? 0 : 1, m.creatorSoldSol > 0.05 ? `sold ${m.creatorSoldSol.toFixed(2)} SOL` : 'not selling');

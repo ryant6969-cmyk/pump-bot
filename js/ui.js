@@ -120,7 +120,7 @@ export class UI {
     this.store = store;
     this.version = version;
     this.tab = 'home';
-    this.coinView = 'study';
+    this.coinView = 'trending';
     this.tracking = false;
     this.tradesView = 'open';
     this.wiz = { step: 0, key: '', keyTest: null, importing: false, style: 'balanced', backupChecked: false, showKey: false, busy: false };
@@ -353,9 +353,7 @@ export class UI {
         </div>
       </div>
       <div class="row mt" style="margin-bottom:10px"><div class="seg" style="flex:1">
-        <button data-action="coin-view" data-view="study" class="${this.coinView === 'study' ? 'on' : ''}">Studied</button>
-        <button data-action="coin-view" data-view="hot" class="${this.coinView === 'hot' ? 'on' : ''}">Moving</button>
-        <button data-action="coin-view" data-view="new" class="${this.coinView === 'new' ? 'on' : ''}">Newest</button></div></div>
+        ${[['trending', 'Trending'], ['movers', 'Movers'], ['mayhem', 'Mayhem'], ['new', 'New']].map(([v, label]) => `<button data-action="coin-view" data-view="${v}" class="${this.coinView === v ? 'on' : ''}">${label}</button>`).join('')}</div></div>
       <div id="coin-head" class="small muted" style="margin:0 4px 8px"></div>
       <div id="coin-list"></div>`;
     this.updateCoins();
@@ -366,30 +364,54 @@ export class UI {
     if (!list) return;
     const b = this.bot;
     const now = Date.now();
+    const view = this.coinView;
     let coins = [...b.coins.values()];
-    const rise = (c) => {
-      const s = c.snaps; if (!s || s.length < 2) return 0;
-      const last = s[s.length - 1];
-      let ref = s[0]; for (const x of s) { if (x.t <= last.t - 60000) ref = x; else break; }
-      return ref.mcap > 0 ? (last.mcap / ref.mcap - 1) * 100 : 0;
-    };
+    const snapAgo = (c, ms) => { const s = c.snaps; const last = s[s.length - 1]; let ref = s[0]; for (const x of s) { if (x.t <= last.t - ms) ref = x; else break; } return ref; };
+    const rise = (c) => { if (!c.snaps || c.snaps.length < 2) return 0; const ref = snapAgo(c, 60000); const last = c.snaps[c.snaps.length - 1]; return ref.mcap > 0 ? (last.mcap / ref.mcap - 1) * 100 : 0; };
+    const inflow = (c) => (c.snaps && c.snaps.length >= 2 ? (c.snaps[c.snaps.length - 1].sol || 0) - (snapAgo(c, 60000).sol || 0) : 0);
+    const mayhem = (c) => !!(c.isMayhemMode || c.curve?.isMayhemMode);
     const order = { passed: 0, study: 1, bought: 2, rejected: 3 };
-    if (this.coinView === 'study') coins = coins.filter((c) => c.verdict || c.stage === 'study' || c.stage === 'passed').sort((a, c) => (order[a.stage] ?? 4) - (order[c.stage] ?? 4) || (c.verdict?.at || c.studyStart || 0) - (a.verdict?.at || a.studyStart || 0));
-    else if (this.coinView === 'hot') coins = coins.filter((c) => c.snaps.length >= 2 && c.watching).sort((a, c) => rise(c) - rise(a));
-    else coins.sort((a, c) => c.createdAt - a.createdAt);
+    const byStage = (a, c) => (order[a.stage] ?? 4) - (order[c.stage] ?? 4);
+    const change = (c, ms) => { if (!c.snaps || c.snaps.length < 2) return 0; const ref = snapAgo(c, ms); const last = c.snaps[c.snaps.length - 1]; return ref.mcap > 0 ? (last.mcap / ref.mcap - 1) * 100 : 0; };
+    // trading activity over 5 minutes: every bit of SOL that moved in or out of the curve
+    const activity = (c) => { let a = 0; const s = c.snaps || []; const from = s.length ? s[s.length - 1].t - 300000 : 0; for (let i = 1; i < s.length; i++) if (s[i].t >= from) a += Math.abs((s[i].sol || 0) - (s[i - 1].sol || 0)); return a; };
+    if (view === 'trending') {
+      // where the money is going: coins the bot is studying first, then the most SOL coming in
+      coins = coins.filter((c) => !mayhem(c) && (c.verdict || c.stage === 'study' || c.stage === 'passed' || (c.watching && inflow(c) > 0.2)))
+        .sort((a, c) => byStage(a, c) || inflow(c) - inflow(a));
+    } else if (view === 'movers') {
+      // like pump.fun's Movers: the biggest price gains right now, among coins people are actually trading
+      coins = coins.filter((c) => !mayhem(c) && c.snaps.length >= 3 && activity(c) >= 0.5 && change(c, 300000) > 0).sort((a, c) => change(c, 300000) - change(a, 300000));
+    } else if (view === 'mayhem') {
+      coins = coins.filter(mayhem).sort((a, c) => byStage(a, c) || rise(c) - rise(a) || c.createdAt - a.createdAt);
+    } else {
+      coins.sort((a, c) => c.createdAt - a.createdAt);
+    }
     coins = coins.slice(0, 60);
     const head = document.getElementById('coin-head');
     const br = b.brain();
-    if (head) head.textContent = b.running ? `${br.pipeline.scanned} scanned · ${br.studying.length} studying · ${br.pipeline.passed} passed · ${b.feed?.isLive() ? 'live' : 'connecting…'}` : 'Start the bot on Home to see coins launching live.';
+    const live = b.feed?.isLive() ? 'live' : 'connecting…';
+    if (head) {
+      head.textContent = !b.running ? 'Start the bot on Home to see coins launching live.'
+        : view === 'movers' ? `Biggest gains in the last 5 minutes · ${live}`
+        : view === 'mayhem' ? `Mayhem coins only · the bot buys one only when it's flying up · ${live}`
+        : `${br.pipeline.scanned} scanned · ${br.studying.length} studying · ${br.pipeline.passed} passed · ${live}`;
+    }
     if (!coins.length) {
-      const study = this.coinView === 'study';
-      patch(list, `<div class="list"><div class="empty"><b>${!b.running ? 'The coin feed is off' : study ? 'Nothing studied yet' : 'Waiting for coins…'}</b>${!b.running ? 'Tap Start on the Home tab. You can still paste a coin address above.' : study ? 'When a new coin gets real buyers, the bot studies its trades for 45 seconds and scores it. Those coins show up here.' : 'New pump.fun coins appear here within seconds.'}</div></div>`);
+      const empty = {
+        trending: ['Nothing trending yet', 'Coins with real buyers and money coming in show up here, with the bot\u2019s score once it studies them.'],
+        movers: ['No movers yet', 'Coins with the biggest price gains in the last 5 minutes (with real trading) show up here.'],
+        mayhem: ['No mayhem coins yet', 'Mayhem coins (pump.fun\u2019s trading agent buys and sells them) show up here. The bot only buys one when the study says it\u2019s flying up.'],
+        new: ['Waiting for coins…', 'New pump.fun coins appear here within seconds.'],
+      }[view] || ['Waiting for coins…', ''];
+      patch(list, `<div class="list"><div class="empty"><b>${!b.running ? 'The coin feed is off' : empty[0]}</b>${!b.running ? 'Tap Start on the Home tab. You can still paste a coin address above.' : empty[1]}</div></div>`);
       return;
     }
-    patch(list, `<div class="list">${coins.map((c) => this.coinRow(c, rise(c), now)).join('')}</div>`);
+    const movers = view === 'movers';
+    patch(list, `<div class="list">${coins.map((c) => this.coinRow(c, movers ? change(c, 300000) : rise(c), now, movers ? '5m' : '1m', view === 'mayhem')).join('')}</div>`);
   }
 
-  coinRow(c, r, now) {
+  coinRow(c, r, now, span = '1m', hideMayhemBadge = false) {
     const held = this.bot.positions.has(this.bot.settings.mode + ':' + c.mint);
     const prog = Math.round((c.lastProgress || 0) * 100);
     const v = c.verdict;
@@ -400,7 +422,7 @@ export class UI {
     return `<button class="coin" data-action="coin" data-mint="${esc(c.mint)}">${v ? scoreRing(v.score, v.ok ? 'pass' : c.stage === 'study' ? '' : 'fail') : avatar(c.symbol, c.mint)}
       <div class="name">${esc(c.name)}<small>${esc(c.symbol)}</small></div>
       <div class="side">${sparkline(c.snaps)}<div class="right">${this.mcapText(c.lastMcap)}</div></div>
-      <div class="meta">${stage ? `<span class="stage ${stage[0]}">${stage[1]}</span>` : ''}${c.isMayhemMode ? '<span class="badge mayhem">MAYHEM</span>' : ''}<span>${ago(c.createdAt, now)}</span><span class="rail"><i style="width:${prog}%"></i></span><span class="change ${cls(r)}">${c.snaps.length >= 2 ? pct(r) : ''}</span></div>
+      <div class="meta">${stage ? `<span class="stage ${stage[0]}">${stage[1]}</span>` : ''}${c.isMayhemMode && !hideMayhemBadge ? '<span class="badge mayhem">MAYHEM</span>' : ''}<span>${ago(c.createdAt, now)}</span><span class="rail"><i style="width:${prog}%"></i></span><span class="change ${cls(r)}">${c.snaps.length >= 2 ? pct(r) + ' ' + span : ''}</span></div>
       ${status ? `<div class="status ${tone}">${esc(status)}</div>` : ''}</button>`;
   }
 
@@ -429,7 +451,7 @@ export class UI {
         </div>
       </div>
       ${list.length ? list.map((w) => this.walletCard(w)).join('') : `<div class="list mt"><div class="empty"><b>No wallets yet</b>Add a trader you like. You'll see their pump.fun buys and sells live, and you can copy them.</div></div>`}
-      <p class="small muted center mt2">Copy trading buys the same pump.fun coin when they buy (with your amount) and sells when they sell, the same share they sold. Your stop loss still protects you. Copies only run while the bot is started.</p>`);
+      <p class="small muted center mt2">Copy trading buys the same pump.fun coin the moment they buy (with your amount) and sells the moment they sell, the same share they sold, on pump.fun or PumpSwap. Your stop loss still protects you. It copies whenever Win Bot is open on screen, even if the bot isn't started.</p>`);
   }
 
   walletCard(w) {
@@ -446,7 +468,7 @@ export class UI {
           <span class="switch"><input type="checkbox" data-wallet-copy="${esc(w.address)}" ${w.copy ? 'checked' : ''}><span></span></span></label>
         ${w.copy ? `<div class="row"><span class="small" style="flex:1">SOL per copied trade</span><div class="stepper"><input data-wallet-sol="${esc(w.address)}" inputmode="decimal" value="${esc(w.copySol)}" aria-label="SOL per copied trade"><span class="small muted">SOL</span></div></div>` : ''}
       </div>
-      <div class="wtrades">${trades.length ? trades.map((t) => `<button class="wtrade" style="background:none;border:0;text-align:left;width:100%" data-action="coin" data-mint="${esc(t.mint)}"><span class="side ${t.buy ? 'b' : 's'}">${t.buy ? 'BUY' : 'SELL'}</span><div><div>${esc(t.symbol || short(t.mint))} · ${this.bot.solUsd ? this.money(t.sol) : solNum(t.sol) + ' SOL'}</div>${t.note ? `<div class="note ${/^Copied|^Copying/.test(t.note) ? 'gold' : ''}">${esc(t.note)}</div>` : ''}</div><time>${ago(t.t, now)}</time></button>`).join('')
+      <div class="wtrades">${trades.length ? trades.map((t) => `<button class="wtrade" style="background:none;border:0;text-align:left;width:100%" ${t.mint ? `data-action="coin" data-mint="${esc(t.mint)}"` : ''}><span class="side ${t.buy ? 'b' : 's'}">${t.buy ? 'BUY' : 'SELL'}</span><div><div>${esc(t.symbol || (t.mint ? short(t.mint) : 'Coin'))}${t.pool ? ' <span class="badge">PUMPSWAP</span>' : ''} · ${this.bot.solUsd ? this.money(t.sol) : solNum(t.sol) + ' SOL'}</div>${t.note ? `<div class="note ${/^Copied|^Copying/.test(t.note) ? 'gold' : ''}">${esc(t.note)}</div>` : ''}</div><time>${ago(t.t, now)}</time></button>`).join('')
         : `<p class="small muted" style="margin:6px 2px">${w.loading ? 'Loading their recent trades…' : 'No pump.fun trades seen yet. New ones show up here live.'}</p>`}</div>
       <div class="row mt"><a class="btn small" style="flex:1" href="https://pump.fun/profile/${esc(w.address)}" target="_blank" rel="noopener">pump.fun profile</a><button class="btn small danger" style="flex:1" data-action="wallet-remove" data-address="${esc(w.address)}">Remove</button></div>
     </div>`;
@@ -617,7 +639,7 @@ export class UI {
       body = `<div class="hero"><div class="logo" role="img" aria-label="Win Bot"></div><h1>Win Bot</h1><p>A pump.fun trading bot that studies every coin before it buys.</p></div>
         <div class="points">
           <div class="point"><span class="n">1</span><p><strong>Practice first</strong>It starts with pretend SOL on real live coins, so you can watch it work.</p></div>
-          <div class="point"><span class="n">2</span><p><strong>It studies before it buys</strong>It reads every trade on a promising coin for 45 seconds: real buyers, money coming in, whales, and whether the creator is selling. Most coins fail. Only strong ones get bought.</p></div>
+          <div class="point"><span class="n">2</span><p><strong>It studies before it buys</strong>It reads every trade on a promising coin for 10 seconds, on top of everything it saw before: real buyers, money coming in, whales, and whether the creator is selling. Most coins fail. Only strong ones get bought.</p></div>
           <div class="point"><span class="n">3</span><p><strong>Your keys stay on this phone</strong>The bot has its own wallet. Nothing is sent to any server of ours.</p></div>
         </div>
         ${isIos() && !isStandalone() ? `<div class="alert warn mt"><span class="ico">📲</span><div class="grow"><strong>First, add it to your Home Screen.</strong> Tap ${ICONS.share} Share at the bottom of Safari, then <em>Add to Home Screen</em>, then open Win Bot from your Home Screen and set it up there. The Home Screen app keeps its own data, so a wallet made here in Safari won't show up there.</div></div>` : ''}`;
@@ -779,10 +801,10 @@ export class UI {
       html = `<h2>Activity</h2>${this.activityList(120)}${close}`;
     } else if (kind === 'help') {
       html = `<div class="help"><h2>How Win Bot works</h2>
-        <h3>What it does</h3><p>It watches every new coin launched on pump.fun. When one starts getting real money, the bot studies it: for 45 seconds it reads every buy and sell. It counts real buyers (ignoring bot wallets that buy and sell over and over, and the mayhem agent), how much SOL is coming in versus going out, whether one whale is doing the buying, whether the creator is selling, and whether the price is holding. That becomes a score out of 100. Only coins that pass every check and score high enough get bought, after a last check that the coins are spread across many wallets.</p>
+        <h3>What it does</h3><p>It watches every new coin launched on pump.fun. When one starts getting real money, the bot studies it: for 10 seconds it reads every buy and sell, together with how the coin moved over the last minute. It counts real buyers (ignoring bot wallets that buy and sell over and over, and the mayhem agent), how much SOL is coming in versus going out, whether one whale is doing the buying, whether the creator is selling, and whether the price is holding. That becomes a score out of 100. Only coins that pass every check and score high enough get bought, after a last check that the coins are spread across many wallets.</p>
         <h3>How it sells</h3><p>It watches every trade on coins it holds and sells right away if the creator starts selling, a big holder dumps, or sellers take over. Otherwise it sells at your take profit, stop loss, trailing stop, or time limit, or if the coin is going nowhere. After losses in a row it gets pickier until the next win.</p>
-        <h3>Mayhem coins</h3><p>Mayhem coins have pump.fun's trading agent buying and selling them, which can fake activity. The bot ignores the agent's trades, studies them for 25 seconds, needs a higher score and a clearly rising price, and takes a quick $5 to $10 profit (more only while it's still flying).</p>
-        <h3>Copy trading</h3><p>On the Wallets tab, add a trader by wallet address, pump.fun profile link, or @username. You'll see their pump.fun trades live. Turn on Copy and the bot buys the same coin when they buy (with your amount) and sells the same share when they sell. It skips a copy if the price already ran up 25% since their buy. Your stop loss still protects copied trades.</p>
+        <h3>Mayhem coins</h3><p>Mayhem coins have pump.fun's trading agent buying and selling them, which can fake activity. The bot ignores the agent's trades, needs a higher score and a clearly rising price, and takes a quick $5 to $10 profit (more only while it's still flying).</p>
+        <h3>Copy trading</h3><p>On the Wallets tab, add a trader by wallet address, pump.fun profile link, or @username. You'll see their pump.fun trades live. Turn on Copy and the bot buys the same coin when they buy (with your amount) and sells the same share when they sell. It skips a copy if the price already ran up 25% since their buy. It follows their sells on PumpSwap too. Your stop loss still protects copied trades. Copying works whenever Win Bot is open on screen, even if the bot isn't started.</p>
         <h3>Keep the app open</h3><p>iPhone pauses web apps in the background, so the bot only trades while Win Bot is open on screen. When it's running it keeps the screen on by itself; plug your phone in. If you leave and come back, it checks your trades right away and sells anything that hit a rule.</p>
         <h3>Practice vs real</h3><p>Practice uses pretend SOL with the same live coins and rules, with prices made 2% worse to be realistic. Real mode uses the SOL in your bot wallet.</p>
         <h3>Fees</h3><p>pump.fun charges about 1.25% per trade. Each trade also pays a small network fee (about 0.0001 to 0.0005 SOL depending on Speed). The first trade of each coin puts about 0.002 SOL into a token account; the bot gets it back after selling.</p>
@@ -932,7 +954,7 @@ export class UI {
           break;
         }
         case 'set': b.updateSettings({ [t.dataset.key]: t.dataset.value }); this.renderSettings(); break;
-        case 'reset-rules': b.updateSettings({ tradeSol: null, maxOpen: null, takeProfitPct: null, stopLossPct: null, trailStartPct: null, trailDropPct: null, maxHoldMin: null, dailyLossSol: null, studySec: 45, mayhemStudySec: 25, mayhemProfitMinUsd: 5, mayhemProfitMaxUsd: 10 }); this.renderSettings(); this.toast('Rules reset to the style defaults.'); break;
+        case 'reset-rules': b.updateSettings({ tradeSol: null, maxOpen: null, takeProfitPct: null, stopLossPct: null, trailStartPct: null, trailDropPct: null, maxHoldMin: null, dailyLossSol: null, studySec: 10, mayhemStudySec: 10, mayhemProfitMinUsd: 5, mayhemProfitMaxUsd: 10 }); this.renderSettings(); this.toast('Rules reset to the style defaults.'); break;
         case 'track': await this.trackWallet(); break;
         case 'wallet-refresh': b.refreshWallet(t.dataset.address).catch((e2) => this.toast(e2.message)); break;
         case 'wallet-remove': {
@@ -1160,14 +1182,14 @@ export class UI {
       const real = b.settings.mode === 'real';
       const ok = await this.confirm({
         title: `Copy ${b.walletLabel(address)}?`,
-        text: `Each time they buy a pump.fun coin, the bot buys ${w.copySol} SOL of it${real ? ' with REAL SOL' : ' (practice SOL)'}, and sells when they sell. It only copies while the bot is started.`,
+        text: `Each time they buy a pump.fun coin, the bot buys ${w.copySol} SOL of it${real ? ' with REAL SOL' : ' (practice SOL)'} right away, and sells when they sell. It copies whenever Win Bot is open on screen.`,
         ok: 'Copy them', danger: real,
       });
       if (!ok) { box.checked = false; return; }
     }
     b.updateWallet(address, { copy: box.checked });
     this.renderWallets();
-    if (box.checked && !b.running) this.toast('Copying is on. Tap Start on Home so the bot can copy.');
+    if (box.checked) this.toast(`Copying ${b.walletLabel(address)}. Keep Win Bot open on screen.`);
   }
 
   async lookupCoin(mint) {
