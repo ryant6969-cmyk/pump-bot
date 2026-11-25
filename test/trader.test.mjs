@@ -94,10 +94,38 @@ test('graduated coin: sells through PumpSwap and unwraps the SOL', async () => {
   assert.equal(chain.get(wsolAta), null, 'temporary wrapped-SOL account closed');
 });
 
+test('graduated coin: buys on PumpSwap (wraps SOL, buys, unwraps the rest), then sells there', async () => {
+  const { chain, wallet, mint, trader } = await setup();
+  await chain.setCurve(mint, { complete: true, realTokenReserves: 0n });
+  const pool = await chain.addPool({ mint });
+  const before = chain.lamports(wallet.address);
+  const b = await trader.buy({ mint, lamports: 50_000_000n });
+  assert.equal(b.via, 'PumpSwap');
+  assert.equal(b.pool, pool);
+  assert.ok(b.tokDelta > 0n, 'got coins');
+  const spent = before - chain.lamports(wallet.address);
+  assert.ok(spent >= 50_000_000n && spent < 50_000_000n + 8_000_000n, 'spent about the amount asked, ' + spent);
+  const wsolAta = await associatedTokenAddress(wallet.address, pump.WSOL, pump.TOKEN);
+  assert.equal(chain.get(wsolAta), null, 'temporary wrapped-SOL account closed');
+  const s = await trader.sell({ mint, tokenProgram: pump.TOKEN_2022, pool });
+  assert.equal(s.via, 'PumpSwap');
+  assert.equal(s.tokDelta, -b.tokDelta);
+});
+
+test('PumpSwap buy: skips when the price ran past the cap, nothing sent', async () => {
+  const { chain, mint, trader } = await setup();
+  await chain.setCurve(mint, { complete: true, realTokenReserves: 0n });
+  await chain.addPool({ mint });
+  const sends = chain.sends;
+  await assert.rejects(() => trader.buy({ mint, lamports: 10_000_000n, maxPrice: 1e-9, refPrice: 0.5e-9 }), (e) => e instanceof TradeError && e.kind === 'skipped');
+  assert.equal(chain.sends, sends);
+});
+
 test('buying a graduated, non-SOL, cashback or unknown coin is refused before any transaction', async () => {
   const { chain, mint, trader } = await setup();
   await chain.setCurve(mint, { complete: true });
-  await assert.rejects(() => trader.buy({ mint, lamports: 10_000_000n }), /graduated/);
+  // graduated but its PumpSwap pool isn't open yet: wait
+  await assert.rejects(() => trader.buy({ mint, lamports: 10_000_000n }), (e) => e instanceof TradeError && e.kind === 'waiting');
   const other = await setup({ curve: { quoteMint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v' } });
   await assert.rejects(() => other.trader.buy({ mint: other.mint, lamports: 10_000_000n }), /SOL/);
   const cb = await setup({ curve: { isCashbackCoin: true } });

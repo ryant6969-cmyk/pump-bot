@@ -1,8 +1,8 @@
 // Solana transactions: build legacy transactions, and read + sign any
 // transaction format (legacy, v0, v1) returned by an outside service.
 
-import { b58decode, b58encode } from './b58.js?v=2.2.1';
-import { compactU16, concat, readCompactU16, readU16, readU32, u32le, u64le } from './bytes.js?v=2.2.1';
+import { b58decode, b58encode } from './b58.js?v=2.3.0';
+import { compactU16, concat, readCompactU16, readU16, readU32, u32le, u64le } from './bytes.js?v=2.3.0';
 
 export const SYSTEM_PROGRAM = '11111111111111111111111111111111';
 export const COMPUTE_BUDGET_PROGRAM = 'ComputeBudget111111111111111111111111111111';

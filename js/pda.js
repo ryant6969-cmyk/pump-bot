@@ -1,8 +1,8 @@
 // Program-derived addresses (PDAs) and associated token accounts.
 
-import { b58decode, b58encode } from './b58.js?v=2.2.1';
-import { concat, textEncoder } from './bytes.js?v=2.2.1';
-import { isOnCurve } from './ed25519.js?v=2.2.1';
+import { b58decode, b58encode } from './b58.js?v=2.3.0';
+import { concat, textEncoder } from './bytes.js?v=2.3.0';
+import { isOnCurve } from './ed25519.js?v=2.3.0';
 
 const MARKER = textEncoder.encode('ProgramDerivedAddress');
 const ATA_PROGRAM = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';

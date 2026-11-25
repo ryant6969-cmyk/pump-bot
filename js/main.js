@@ -2,11 +2,11 @@
 // keeps the screen awake while the bot works, and catches up after the app
 // returns from the background.
 
-import { Store, requestPersistentStorage } from './store.js?v=2.2.1';
-import { Bot } from './bot.js?v=2.2.1';
-import { UI, esc } from './ui.js?v=2.2.1';
+import { Store, requestPersistentStorage } from './store.js?v=2.3.0';
+import { Bot } from './bot.js?v=2.3.0';
+import { UI, esc } from './ui.js?v=2.3.0';
 
-const VERSION = '2.2.1';
+const VERSION = '2.3.0';
 
 class WakeLock {
   constructor(onChange) { this.lock = null; this.onChange = onChange; }

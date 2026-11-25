@@ -1,9 +1,9 @@
 // Everything on screen. Plain DOM, no framework. Every value that comes from
 // the network or a coin (names, symbols, errors) is escaped before display.
 
-import * as pump from './pump.js?v=2.2.1';
-import { STYLES, SPEEDS, resolveRules } from './strategy.js?v=2.2.1';
-import { isAddress } from './b58.js?v=2.2.1';
+import * as pump from './pump.js?v=2.3.0';
+import { STYLES, SPEEDS, resolveRules } from './strategy.js?v=2.3.0';
+import { isAddress } from './b58.js?v=2.3.0';
 
 export function esc(v) {
   return String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -451,7 +451,7 @@ export class UI {
         </div>
       </div>
       ${list.length ? list.map((w) => this.walletCard(w)).join('') : `<div class="list mt"><div class="empty"><b>No wallets yet</b>Add a trader you like. You'll see their pump.fun buys and sells live, and you can copy them.</div></div>`}
-      <p class="small muted center mt2">Copy trading buys the same pump.fun coin the moment they buy (with your amount) and sells the moment they sell, the same share they sold, on pump.fun or PumpSwap. Your stop loss still protects you. It copies whenever Win Bot is open on screen, even if the bot isn't started.</p>`);
+      <p class="small muted center mt2">Copy trading buys the same coin the moment they buy (with your amount), on pump.fun or PumpSwap, and sells the moment they sell, the same share they sold. Your stop loss still protects you. It copies whenever Win Bot is open on screen, even if the bot isn't started.</p>`);
   }
 
   walletCard(w) {
@@ -517,7 +517,7 @@ export class UI {
     return `<div class="card pos">
       <div class="top">${avatar(p.symbol, p.mint)}<div class="grow" style="flex:1"><div style="font-weight:700">${esc(p.name)}</div><div class="small muted">${esc(p.symbol)} · <span class="badge ${p.mode}">${p.mode === 'real' ? 'REAL' : 'PRACTICE'}</span>${p.copiedFrom ? ' <span class="badge copy">COPY</span>' : ''}${p.mayhem ? ' <span class="badge mayhem">MAYHEM</span>' : ''}${p.score !== null && p.score !== undefined ? ` <span class="badge gold">SCORE ${esc(p.score)}</span>` : ''}</div></div>
       <div class="pnl ${cls(pnl ?? 0)}">${pnl !== null ? this.money(pnl, { sign: true }) : '…'}<small>${pp !== null ? pct(pp) + ' · ' + signed(pnl) + ' SOL' : 'pricing…'}</small></div></div>
-      <div class="facts"><div class="fact"><b>${this.money(cost)}</b><span>Paid</span></div><div class="fact"><b>${value !== null ? this.money(value) : '–'}</b><span>Worth now</span></div><div class="fact"><b>${p.complete ? 'Graduated' : Math.round((p.progress || 0) * 100) + '%'}</b><span>Curve</span></div></div>
+      <div class="facts"><div class="fact"><b>${this.money(cost)}</b><span>Paid</span></div><div class="fact"><b>${value !== null ? this.money(value) : '–'}</b><span>Worth now</span></div><div class="fact"><b>${p.onPool ? 'PumpSwap' : p.complete ? 'Graduated' : Math.round((p.progress || 0) * 100) + '%'}</b><span>${p.onPool ? 'Market' : 'Curve'}</span></div></div>
       <div class="state">${state}</div>
       ${this.sellButtons(p)}
       <div class="actions"><a class="btn small" style="flex:1" href="https://pump.fun/coin/${esc(p.mint)}" target="_blank" rel="noopener">Chart</a>${p.buySig ? `<a class="btn small" style="flex:1" href="https://solscan.io/tx/${esc(p.buySig)}" target="_blank" rel="noopener">Solscan</a>` : ''}</div></div>`;
@@ -804,7 +804,7 @@ export class UI {
         <h3>What it does</h3><p>It watches every new coin launched on pump.fun. When one starts getting real money, the bot studies it: for 10 seconds it reads every buy and sell, together with how the coin moved over the last minute. It counts real buyers (ignoring bot wallets that buy and sell over and over, and the mayhem agent), how much SOL is coming in versus going out, whether one whale is doing the buying, whether the creator is selling, and whether the price is holding. That becomes a score out of 100. Only coins that pass every check and score high enough get bought, after a last check that the coins are spread across many wallets.</p>
         <h3>How it sells</h3><p>It watches every trade on coins it holds and sells right away if the creator starts selling, a big holder dumps, or sellers take over. Otherwise it sells at your take profit, stop loss, trailing stop, or time limit, or if the coin is going nowhere. After losses in a row it gets pickier until the next win.</p>
         <h3>Mayhem coins</h3><p>Mayhem coins have pump.fun's trading agent buying and selling them, which can fake activity. The bot ignores the agent's trades, needs a higher score and a clearly rising price, and takes a quick $5 to $10 profit (more only while it's still flying).</p>
-        <h3>Copy trading</h3><p>On the Wallets tab, add a trader by wallet address, pump.fun profile link, or @username. You'll see their pump.fun trades live. Turn on Copy and the bot buys the same coin when they buy (with your amount) and sells the same share when they sell. It skips a copy if the price already ran up 25% since their buy. It follows their sells on PumpSwap too. Your stop loss still protects copied trades. Copying works whenever Win Bot is open on screen, even if the bot isn't started.</p>
+        <h3>Copy trading</h3><p>On the Wallets tab, add a trader by wallet address, pump.fun profile link, or @username. You'll see their pump.fun and PumpSwap trades live. Turn on Copy and the bot buys the same coin when they buy (with your amount), including graduated coins on PumpSwap, and sells the same share when they sell. It skips a copy if the price already ran up 25% since their buy. Your stop loss still protects copied trades. Copying works whenever Win Bot is open on screen, even if the bot isn't started.</p>
         <h3>Keep the app open</h3><p>iPhone pauses web apps in the background, so the bot only trades while Win Bot is open on screen. When it's running it keeps the screen on by itself; plug your phone in. If you leave and come back, it checks your trades right away and sells anything that hit a rule.</p>
         <h3>Practice vs real</h3><p>Practice uses pretend SOL with the same live coins and rules, with prices made 2% worse to be realistic. Real mode uses the SOL in your bot wallet.</p>
         <h3>Fees</h3><p>pump.fun charges about 1.25% per trade. Each trade also pays a small network fee (about 0.0001 to 0.0005 SOL depending on Speed). The first trade of each coin puts about 0.002 SOL into a token account; the bot gets it back after selling.</p>

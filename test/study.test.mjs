@@ -203,6 +203,62 @@ test('copy trading: when they sell a graduated coin on PumpSwap, the bot sells t
   assert.equal(w.trades[0].mint, t.mint);
 });
 
+for (const mode of ['practice', 'real']) {
+  test(`copy trading (${mode}): copies their buy of a graduated coin on PumpSwap, then their sell`, async () => {
+    const { encodeAmmTradeEvent } = await import('./mockchain.mjs');
+    const t = await setup({ mode, sol: 2 });
+    if (mode === 'real') await t.bot.refreshBalance();
+    const leader = b58encode(nodeCrypto.randomBytes(32));
+    await t.bot.trackWallet(leader);
+    t.bot.updateWallet(leader, { copy: true, copySol: 0.1 });
+    await sleep(5);
+    await t.chain.setCurve(t.mint, { complete: true, realTokenReserves: 0n });
+    const pool = await t.chain.addPool({ mint: t.mint });
+    // they buy 1 SOL worth on PumpSwap at about the pool's price
+    const base = 200_000_000_000_000n * 1_000_000_000n / (85_000_000_000n + 1_000_000_000n);
+    const buy = encodeAmmTradeEvent({ isBuy: true, baseAmount: base, userBaseBefore: 0n, solAmount: 1_000_000_000n, pool, user: leader });
+    TestWS.push(leader, pumpLogs([buy], { program: pump.PUMP_AMM }));
+    await until(() => t.bot.positions.size === 1);
+    const p = [...t.bot.positions.values()][0];
+    assert.equal(p.copiedFrom, leader);
+    assert.equal(p.onPool, true);
+    assert.equal(p.pool, pool);
+    if (mode === 'real') assert.equal(p.via, 'PumpSwap');
+    const w = t.bot.wallets[0];
+    await until(() => w.trades[0].note === 'Copied');
+    assert.equal(w.trades[0].note, 'Copied');
+    assert.equal(w.trades[0].mint, t.mint);
+    // a graduated coin is not sold just for being graduated
+    await t.step();
+    assert.equal(t.bot.positions.size, 1, 'still held');
+    assert.ok(p.lastValueLamports > 0n, 'valued on PumpSwap');
+    // they sell everything: so does the bot
+    const sell = encodeAmmTradeEvent({ isBuy: false, baseAmount: base, userBaseBefore: base, solAmount: 990_000_000n, pool, user: leader });
+    TestWS.push(leader, pumpLogs([sell], { program: pump.PUMP_AMM }));
+    await until(() => t.bot.positions.size === 0, 6000);
+    assert.equal(t.bot.positions.size, 0, 'sold');
+    assert.match(t.bot.history[0].reason, /sold/);
+  });
+}
+
+test('copy trading: a PumpSwap buy that already ran up 25%+ is not chased', async () => {
+  const { encodeAmmTradeEvent } = await import('./mockchain.mjs');
+  const t = await setup({ mode: 'practice' });
+  const leader = b58encode(nodeCrypto.randomBytes(32));
+  await t.bot.trackWallet(leader);
+  t.bot.updateWallet(leader, { copy: true });
+  await sleep(5);
+  await t.chain.setCurve(t.mint, { complete: true, realTokenReserves: 0n });
+  const pool = await t.chain.addPool({ mint: t.mint });
+  // they paid half of today's price
+  const base = 2n * 200_000_000_000_000n * 1_000_000_000n / 85_000_000_000n;
+  const buy = encodeAmmTradeEvent({ isBuy: true, baseAmount: base, userBaseBefore: 0n, solAmount: 1_000_000_000n, pool, user: leader });
+  TestWS.push(leader, pumpLogs([buy], { program: pump.PUMP_AMM }));
+  await until(() => /already up/.test(t.bot.wallets[0].trades[0]?.note || ''));
+  assert.match(t.bot.wallets[0].trades[0].note, /already up/);
+  assert.equal(t.bot.positions.size, 0);
+});
+
 // ---------- practice money ----------
 
 test('practice money: the one-time $500 is added once the SOL price loads, and only once', async () => {

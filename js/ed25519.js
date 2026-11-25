@@ -4,7 +4,7 @@
 // Solana uses for program-derived addresses.
 // test/crypto.test.mjs checks every function against Node's native Ed25519.
 
-import { concat } from './bytes.js?v=2.2.1';
+import { concat } from './bytes.js?v=2.3.0';
 
 const P = (1n << 255n) - 19n;
 const L = (1n << 252n) + 27742317777372353535851937790883648493n;

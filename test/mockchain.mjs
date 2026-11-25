@@ -323,6 +323,15 @@ export class MockChain {
             state.set(ata, { lamports: RENT[tp], owner: tp, data: encodeTokenAccount(mint, owner, 0n) });
           }
         } else if (ix.program === pump.TOKEN || ix.program === pump.TOKEN_2022) {
+          if (ix.data[0] === 17 && ix.data.length === 1) {
+            // SyncNative: a wrapped-SOL account's balance becomes its lamports above rent
+            const a = req(tx.keys[ix.accts[0]]);
+            const ta = pump.decodeTokenAccount(a.data);
+            if (a.owner !== ix.program || ta.mint !== pump.WSOL) throw new Custom(3); // InvalidAccountData-ish
+            setTok(tx.keys[ix.accts[0]], a.lamports - RENT[pump.TOKEN]);
+            logs.push(`Program ${ix.program} success`);
+            continue;
+          }
           if (ix.data[0] !== 9) throw new Error('only CloseAccount');
           const [acct, dest, owner] = ix.accts.map((i) => tx.keys[i]);
           ensureSigner(ix.accts[2]);
@@ -388,12 +397,33 @@ export class MockChain {
           }
         } else if (ix.program === pump.PUMP_AMM) {
           const disc = Array.from(ix.data.slice(0, 8)).join(',');
-          if (disc !== '93,246,130,60,231,233,64,178') throw new Custom(101);
-          const acc = await this._validateAgainstIdl('pump_amm', 'sell_v2', tx, ix, state);
+          const isAmmBuy = disc === '194,171,28,70,104,77,91,47';
+          if (disc !== '93,246,130,60,231,233,64,178' && !isAmmBuy) throw new Custom(101);
+          const acc = await this._validateAgainstIdl('pump_amm', isAmmBuy ? 'buy_exact_quote_in_v2' : 'sell_v2', tx, ix, state);
           const p = pump.decodePool(req(acc.pool).data);
           if (p.poolBaseTokenAccount !== acc.pool_base_token_account || p.poolQuoteTokenAccount !== acc.pool_quote_token_account) throw new Custom(6014);
           const buybackAtas = await Promise.all(pump.BUYBACK_FEE_RECIPIENTS.map((b) => associatedTokenAddress(b, pump.WSOL, pump.TOKEN)));
           if (!buybackAtas.includes(acc.buyback_fee_recipient)) throw new Custom(6057);
+          if (p.isCashbackCoin) throw new Custom(6079);
+          if (isAmmBuy) {
+            const spend = readU64(ix.data, 8), minBase = readU64(ix.data, 16);
+            if (spend === 0n || minBase === 0n) throw new Custom(6000);
+            req(acc.user_base_token_account);
+            if (tokAmt(acc.user_quote_token_account) < spend) throw new Custom(1);
+            const B = tokAmt(acc.pool_base_token_account), Q = tokAmt(acc.pool_quote_token_account) + p.virtualQuoteReserves;
+            const net = (spend * 10000n) / 10125n;
+            const out = (net * B) / (Q + net);
+            if (out < minBase) throw new Custom(6040);
+            setTok(acc.user_quote_token_account, tokAmt(acc.user_quote_token_account) - spend);
+            req(acc.user_quote_token_account).lamports -= spend;
+            setTok(acc.pool_quote_token_account, tokAmt(acc.pool_quote_token_account) + spend);
+            req(acc.pool_quote_token_account).lamports += spend;
+            setTok(acc.pool_base_token_account, B - out);
+            setTok(acc.user_base_token_account, tokAmt(acc.user_base_token_account) + out);
+            if (!get(acc.user_volume_accumulator)) state.set(acc.user_volume_accumulator, { lamports: RENT_UVA, owner: pump.PUMP_AMM, data: new Uint8Array(1) });
+            logs.push(`Program ${ix.program} success`);
+            continue;
+          }
           const amount = readU64(ix.data, 8), minOut = readU64(ix.data, 16);
           if (tokAmt(acc.user_base_token_account) < amount) throw new Custom(1);
           req(acc.user_quote_token_account);

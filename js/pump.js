@@ -2,10 +2,10 @@
 // and the trade instructions (bonding curve v3 and PumpSwap v2), following
 // github.com/pump-fun/pump-public-docs (IDL as of November 2026).
 
-import { b58encode, isAddress } from './b58.js?v=2.2.1';
-import { concat, fromBase64, readI128, readI64, readU32, readU64, textDecoder, u64le } from './bytes.js?v=2.2.1';
-import { associatedTokenAddress, pda, toBytes } from './pda.js?v=2.2.1';
-import { SYSTEM_PROGRAM } from './tx.js?v=2.2.1';
+import { b58encode, isAddress } from './b58.js?v=2.3.0';
+import { concat, fromBase64, readI128, readI64, readU32, readU64, textDecoder, u64le } from './bytes.js?v=2.3.0';
+import { associatedTokenAddress, pda, toBytes } from './pda.js?v=2.3.0';
+import { SYSTEM_PROGRAM } from './tx.js?v=2.3.0';
 
 export const PUMP = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
 export const PUMP_AMM = 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA';
@@ -41,6 +41,7 @@ const DISC = {
   buyExactQuoteInV3: [225, 247, 80, 30, 213, 179, 132, 136],
   sellV3: [28, 146, 222, 119, 38, 196, 105, 213],
   ammSellV2: [93, 246, 130, 60, 231, 233, 64, 178],
+  ammBuyExactQuoteInV2: [194, 171, 28, 70, 104, 77, 91, 47],
   createEvent: [27, 114, 169, 77, 222, 235, 99, 118],
   tradeEvent: [189, 219, 127, 211, 78, 230, 97, 238],
   ammBuyEvent: [103, 244, 82, 31, 44, 245, 119, 119],
@@ -220,6 +221,13 @@ export function poolSellLamportsOut(baseReserve, effectiveQuoteReserve, tokens, 
   return gross > fee ? gross - fee : 0n;
 }
 
+/** Tokens received for spending `lamportsIn` (fees included) on a PumpSwap pool. */
+export function poolBuyTokensOut(baseReserve, effectiveQuoteReserve, lamportsIn, feeBps = FEE_BPS) {
+  const net = (lamportsIn * 10000n) / (10000n + feeBps);
+  if (net <= 0n || baseReserve <= 0n || effectiveQuoteReserve <= 0n) return 0n;
+  return (net * baseReserve) / (effectiveQuoteReserve + net);
+}
+
 export function poolMarketCapLamports(baseReserve, effectiveQuoteReserve, supply) {
   if (baseReserve <= 0n) return 0n;
   return (effectiveQuoteReserve * supply) / baseReserve;
@@ -321,8 +329,8 @@ export function sellV3Ix(keys, amount, minSolOutput) {
   return { programId: PUMP, keys, data: concat(Uint8Array.from(DISC.sellV3), u64le(amount), u64le(minSolOutput)) };
 }
 
-/** The 17 accounts of PumpSwap sell_v2 (docs/instructions/PUMP_SWAP_TRADE_V2.md) for a SOL pool. */
-export async function ammSellAccounts(user, mint, baseTokenProgram, pool, poolState) {
+/** The 17 accounts of PumpSwap buy_v2 / buy_exact_quote_in_v2 / sell_v2 (docs/instructions/PUMP_SWAP_TRADE_V2.md) for a SOL pool. */
+export async function ammTradeAccounts(user, mint, baseTokenProgram, pool, poolState) {
   const buyback = pickBuybackRecipient();
   const [userBase, userQuote, userVolumeAccumulator, eventAuthority, buybackAta] = await Promise.all([
     associatedTokenAddress(user, mint, baseTokenProgram),
@@ -353,6 +361,19 @@ export async function ammSellAccounts(user, mint, baseTokenProgram, pool, poolSt
     r(PUMP_AMM),
   ];
   return { keys, userBase, userQuote };
+}
+
+export const ammSellAccounts = ammTradeAccounts;
+
+/** SPL Token SyncNative: makes a wrapped-SOL account's token balance match its lamports. */
+export function syncNative(account, tokenProgram = TOKEN) {
+  return { programId: tokenProgram, keys: [{ pubkey: account, isSigner: false, isWritable: true }], data: Uint8Array.of(17) };
+}
+
+export function ammBuyExactQuoteInV2Ix(keys, spendableQuoteIn, minBaseAmountOut) {
+  if (spendableQuoteIn <= 0n) throw new Error('Buy amount must be above zero');
+  if (minBaseAmountOut <= 0n) throw new Error('Minimum tokens must be above zero');
+  return { programId: PUMP_AMM, keys, data: concat(Uint8Array.from(DISC.ammBuyExactQuoteInV2), u64le(spendableQuoteIn), u64le(minBaseAmountOut)) };
 }
 
 export function ammSellV2Ix(keys, baseAmountIn, minQuoteAmountOut) {

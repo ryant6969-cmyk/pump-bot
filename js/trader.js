@@ -5,14 +5,14 @@
 //      tokens would change; refuse to sign if anything looks wrong
 //   4. sign, send, re-send until confirmed, then read the exact result.
 
-import { fromBase64, readU32, readU64, toBase64 } from './bytes.js?v=2.2.1';
-import { associatedTokenAddress } from './pda.js?v=2.2.1';
-import * as pump from './pump.js?v=2.2.1';
+import { fromBase64, readU32, readU64, toBase64 } from './bytes.js?v=2.3.0';
+import { associatedTokenAddress } from './pda.js?v=2.3.0';
+import * as pump from './pump.js?v=2.3.0';
 import {
   buildLegacyTransaction, parseTransaction, signTransaction, transactionId,
   setComputeUnitLimit, setComputeUnitPrice, systemTransfer, SYSTEM_PROGRAM, COMPUTE_BUDGET_PROGRAM,
-} from './tx.js?v=2.2.1';
-import { SPEEDS } from './strategy.js?v=2.2.1';
+} from './tx.js?v=2.3.0';
+import { SPEEDS } from './strategy.js?v=2.3.0';
 
 const PUMPPORTAL_TRADE = 'https://pumpportal.fun/api/trade-local';
 const MEMO_PROGRAM = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr';
@@ -80,6 +80,10 @@ export function explainTxError(err, programAt = () => null) {
   }
   if (err.InsufficientFundsForRent) return { kind: 'funds', message: 'Not enough SOL left to cover account rent.' };
   return { kind: 'failed', message: 'The trade failed on-chain.' };
+}
+
+function priceRanAway(now, refPrice) {
+  return new TradeError(refPrice ? `the price is already up ${Math.round((now / refPrice - 1) * 100)}% since they bought` : 'the price ran away', { kind: 'skipped' });
 }
 
 export class Trader {
@@ -158,17 +162,17 @@ export class Trader {
   // ---------- trades ----------
 
   /** maxPrice (SOL per raw token): don't buy if the coin already costs more than that (copy trading). */
-  async buy({ mint, lamports, slippagePct = 15, speed = 'fast', maxPrice = null, refPrice = null }) {
+  async buy({ mint, lamports, slippagePct = 15, speed = 'fast', maxPrice = null, refPrice = null, pool = null }) {
     lamports = BigInt(lamports);
     const user = this.wallet.address;
     const st = await this.coinState(mint);
     const c = st.curve;
-    if (!c) throw new TradeError("This isn't a pump.fun coin (or it's very old).", { kind: 'unsupported' });
-    if (maxPrice && !c.complete && c.virtualTokenReserves > 0n) {
+    // graduated (or never on a curve): buy on its PumpSwap pool instead
+    if (!c || c.complete || pool) return this._buyOnPool({ mint, lamports, slippagePct, speed, maxPrice, refPrice, st, pool });
+    if (maxPrice && c.virtualTokenReserves > 0n) {
       const now = Number(c.virtualQuoteReserves) / Number(c.virtualTokenReserves);
-      if (now > maxPrice) throw new TradeError(refPrice ? `the price is already up ${Math.round((now / refPrice - 1) * 100)}% since they bought` : 'the price ran away', { kind: 'skipped' });
+      if (now > maxPrice) throw priceRanAway(now, refPrice);
     }
-    if (c.complete) throw new TradeError('This coin already graduated to PumpSwap. The bot only buys coins still on pump.fun.', { kind: 'unsupported' });
     if (!pump.isSolPaired(c) || c.depth > 0) throw new TradeError("This coin isn't paired with SOL. The bot only trades SOL coins.", { kind: 'unsupported' });
     if (c.isCashbackCoin) throw new TradeError("This coin type can't be traded by the bot.", { kind: 'unsupported' });
     const expected = pump.curveBuyTokensOut(c, lamports);
@@ -185,8 +189,52 @@ export class Trader {
     return { ...r, tokenProgram: st.tokenProgram, ata: acc.associatedBaseUser, via: 'pump.fun' };
   }
 
+  /** A coin's PumpSwap pool (the canonical one unless `pool` is given) with its live reserves. */
+  async poolState(mint, pool = null) {
+    pool = pool || await pump.canonicalPoolAddress(mint);
+    const [poolAcc] = await this.getAccounts([pool]);
+    const ps = poolAcc && poolAcc.owner === pump.PUMP_AMM ? pump.decodePool(poolAcc.data) : null;
+    if (!ps || ps.baseMint !== mint) return null;
+    const [baseAcc, quoteAcc] = await this.getAccounts([ps.poolBaseTokenAccount, ps.poolQuoteTokenAccount]);
+    const baseReserve = pump.decodeTokenAccount(baseAcc?.data)?.amount ?? 0n;
+    const quoteReserve = (pump.decodeTokenAccount(quoteAcc?.data)?.amount ?? 0n) + ps.virtualQuoteReserves;
+    return { pool, ps, baseReserve, quoteReserve };
+  }
+
+  /** Buy a graduated coin on PumpSwap: wrap SOL, buy_exact_quote_in_v2, unwrap what's left. */
+  async _buyOnPool({ mint, lamports, slippagePct, speed, maxPrice, refPrice, st, pool }) {
+    const user = this.wallet.address;
+    const p = await this.poolState(mint, pool);
+    if (!p) {
+      if (st.curve?.complete) throw new TradeError('This coin is moving to PumpSwap right now. Try again in a moment.', { kind: 'waiting' });
+      throw new TradeError("This isn't a pump.fun coin (or it's very old).", { kind: 'unsupported' });
+    }
+    const { ps, baseReserve, quoteReserve } = p;
+    if (ps.quoteMint !== pump.WSOL) throw new TradeError("This coin isn't paired with SOL. The bot only trades SOL coins.", { kind: 'unsupported' });
+    if (ps.isCashbackCoin) throw new TradeError("This coin type can't be traded by the bot.", { kind: 'unsupported' });
+    if (maxPrice && baseReserve > 0n) {
+      const now = Number(quoteReserve) / Number(baseReserve);
+      if (now > maxPrice) throw priceRanAway(now, refPrice);
+    }
+    const expected = pump.poolBuyTokensOut(baseReserve, quoteReserve, lamports);
+    if (expected <= 0n) throw new TradeError("Couldn't price this coin on PumpSwap right now.", { kind: 'waiting' });
+    const minOut = (expected * BigInt(Math.round((100 - slippagePct) * 100))) / 10000n || 1n;
+    const a = await pump.ammTradeAccounts(user, mint, st.tokenProgram, p.pool, ps);
+    const core = [
+      pump.createAtaIdempotent(user, a.userBase, user, mint, st.tokenProgram),
+      pump.createAtaIdempotent(user, a.userQuote, user, pump.WSOL, pump.TOKEN),
+      systemTransfer(user, a.userQuote, lamports),
+      pump.syncNative(a.userQuote),
+      pump.ammBuyExactQuoteInV2Ix(a.keys, lamports, minOut),
+      pump.closeTokenAccount(a.userQuote, user, user, pump.TOKEN),
+    ];
+    const expect = { side: 'buy', maxSolDecrease: lamports + BUY_EXTRA_ALLOWANCE, minTokenIncrease: minOut };
+    const r = await this._execute({ kind: 'buy', mint, speed, core, tokenAccount: a.userBase, writable: [p.pool], expect });
+    return { ...r, tokenProgram: st.tokenProgram, ata: a.userBase, via: 'PumpSwap', pool: p.pool };
+  }
+
   /** Sell `amount` raw tokens (or everything when amount is null). */
-  async sell({ mint, tokenProgram, amount = null, slippagePct = 25, speed = 'fast', allowFallback = true }) {
+  async sell({ mint, tokenProgram, amount = null, slippagePct = 25, speed = 'fast', allowFallback = true, pool = null }) {
     const user = this.wallet.address;
     // read the coin and our token account together (one round trip) when the token program is known
     const guessAta = tokenProgram ? await associatedTokenAddress(user, mint, tokenProgram) : null;
@@ -209,14 +257,11 @@ export class Trader {
       writable = [acc.bondingCurve];
       venue = 'pump.fun';
     } else {
-      const pool = await pump.canonicalPoolAddress(mint);
-      const [poolAcc] = await this.getAccounts([pool]);
-      const ps = poolAcc && poolAcc.owner === pump.PUMP_AMM ? pump.decodePool(poolAcc.data) : null;
-      if (!ps) throw new TradeError('This coin is moving to PumpSwap. The bot will sell as soon as it opens.', { kind: 'waiting' });
+      const p = await this.poolState(mint, pool);
+      if (!p) throw new TradeError('This coin is moving to PumpSwap. The bot will sell as soon as it opens.', { kind: 'waiting' });
+      const { ps, baseReserve, quoteReserve } = p;
+      pool = p.pool;
       if (ps.isCashbackCoin) throw new TradeError("This coin type can't be sold by the bot. Import the wallet into Phantom to sell it.", { kind: 'unsupported' });
-      const [baseAcc, quoteAcc] = await this.getAccounts([ps.poolBaseTokenAccount, ps.poolQuoteTokenAccount]);
-      const baseReserve = pump.decodeTokenAccount(baseAcc?.data)?.amount ?? 0n;
-      const quoteReserve = (pump.decodeTokenAccount(quoteAcc?.data)?.amount ?? 0n) + ps.virtualQuoteReserves;
       expectedOut = pump.poolSellLamportsOut(baseReserve, quoteReserve, qty);
       if (expectedOut <= 0n) throw new TradeError("Couldn't price this coin on PumpSwap right now. Will retry.", { kind: 'waiting' });
       const minOut = (expectedOut * slipBps) / 10000n;

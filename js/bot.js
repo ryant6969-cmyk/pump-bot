@@ -2,17 +2,17 @@
 // and sells by its exit rules. Works the same in Practice (fake SOL, real
 // live prices) and Real mode. All state is saved on the phone.
 
-import { isAddress, b58encode } from './b58.js?v=2.2.1';
-import { Keypair } from './keys.js?v=2.2.1';
-import { associatedTokenAddress } from './pda.js?v=2.2.1';
-import * as pump from './pump.js?v=2.2.1';
-import { Rpc, ChainStream, normalizeRpcInput } from './rpc.js?v=2.2.1';
-import { CoinFeed } from './feeds.js?v=2.2.1';
-import { Trader, TradeError, readMeta } from './trader.js?v=2.2.1';
-import { DEFAULT_SETTINGS, STYLES, resolveRules, migrateSettings, evaluateScan, evaluateHolders, evaluateExit, snapAt } from './strategy.js?v=2.2.1';
-import { Tape, judge, fatalDuringStudy, flowSignals } from './analyst.js?v=2.2.1';
-import { resolveWallet, walletActivityFromLogs } from './wallets.js?v=2.2.1';
-import { fromBase64 } from './bytes.js?v=2.2.1';
+import { isAddress, b58encode } from './b58.js?v=2.3.0';
+import { Keypair } from './keys.js?v=2.3.0';
+import { associatedTokenAddress } from './pda.js?v=2.3.0';
+import * as pump from './pump.js?v=2.3.0';
+import { Rpc, ChainStream, normalizeRpcInput } from './rpc.js?v=2.3.0';
+import { CoinFeed } from './feeds.js?v=2.3.0';
+import { Trader, TradeError, readMeta } from './trader.js?v=2.3.0';
+import { DEFAULT_SETTINGS, STYLES, resolveRules, migrateSettings, evaluateScan, evaluateHolders, evaluateExit, snapAt } from './strategy.js?v=2.3.0';
+import { Tape, judge, fatalDuringStudy, flowSignals } from './analyst.js?v=2.3.0';
+import { resolveWallet, walletActivityFromLogs } from './wallets.js?v=2.3.0';
+import { fromBase64 } from './bytes.js?v=2.3.0';
 
 const POLL_MS = 2500;
 const MAX_WATCH = 99;
@@ -691,7 +691,7 @@ export class Bot extends EventTarget {
       }
     }
     if (p.complete) {
-      const v = await this._poolValue(p.mint, BigInt(p.tokens)).catch(() => null);
+      const v = await this._poolValue(p.mint, BigInt(p.tokens), p.pool || null).catch(() => null);
       if (v !== null) { p.lastValueLamports = v; p.valuedAt = t; }
     }
     if (p.lastValueLamports !== undefined) {
@@ -700,22 +700,28 @@ export class Bot extends EventTarget {
     }
   }
 
-  async _poolValue(mint, tokens) {
-    const hit = this.poolCache.get(mint);
-    let pool = hit && this.now() - hit.at < 4000 ? hit : null;
-    if (!pool) {
-      const addr = await pump.canonicalPoolAddress(mint);
-      const r1 = await this.rpc.call('getMultipleAccounts', [[addr], { encoding: 'base64', commitment: 'confirmed' }]);
-      const a = r1.value[0];
-      const ps = a && a.owner === pump.PUMP_AMM ? pump.decodePool(fromBase64(a.data[0])) : null;
-      if (!ps) return null;
-      const r2 = await this.rpc.call('getMultipleAccounts', [[ps.poolBaseTokenAccount, ps.poolQuoteTokenAccount], { encoding: 'base64', commitment: 'confirmed' }]);
-      const base = r2.value[0] ? pump.decodeTokenAccount(fromBase64(r2.value[0].data[0]))?.amount ?? 0n : 0n;
-      const quote = (r2.value[1] ? pump.decodeTokenAccount(fromBase64(r2.value[1].data[0]))?.amount ?? 0n : 0n) + ps.virtualQuoteReserves;
-      pool = { base, quote, at: this.now() };
-      this.poolCache.set(mint, pool);
-    }
-    return pump.poolSellLamportsOut(pool.base, pool.quote, tokens);
+  async _poolValue(mint, tokens, poolAddr = null) {
+    const pool = await this._readPool(mint, poolAddr);
+    return pool ? pump.poolSellLamportsOut(pool.base, pool.quote, tokens) : null;
+  }
+
+  /** A coin's PumpSwap pool and live reserves (cached a few seconds). null if there isn't one. */
+  async _readPool(mint, poolAddr = null) {
+    const key = mint + '|' + (poolAddr || '');
+    const hit = this.poolCache.get(key);
+    if (hit && this.now() - hit.at < 4000) return hit;
+    const addr = poolAddr || await pump.canonicalPoolAddress(mint);
+    const r1 = await this.rpc.call('getMultipleAccounts', [[addr], { encoding: 'base64', commitment: 'confirmed' }]);
+    const a = r1.value[0];
+    const ps = a && a.owner === pump.PUMP_AMM ? pump.decodePool(fromBase64(a.data[0])) : null;
+    if (!ps || ps.baseMint !== mint) return null;
+    const r2 = await this.rpc.call('getMultipleAccounts', [[ps.poolBaseTokenAccount, ps.poolQuoteTokenAccount], { encoding: 'base64', commitment: 'confirmed' }]);
+    const base = r2.value[0] ? pump.decodeTokenAccount(fromBase64(r2.value[0].data[0]))?.amount ?? 0n : 0n;
+    const quote = (r2.value[1] ? pump.decodeTokenAccount(fromBase64(r2.value[1].data[0]))?.amount ?? 0n : 0n) + ps.virtualQuoteReserves;
+    const pool = { addr, ps, base, quote, at: this.now() };
+    this.poolCache.set(key, pool);
+    if (this.poolCache.size > 200) this.poolCache.delete(this.poolCache.keys().next().value);
+    return pool;
   }
 
   // ---------- studying coins ----------
@@ -899,22 +905,37 @@ export class Bot extends EventTarget {
       if (mode === 'practice') {
         const st = await this._readCoin(mint);
         const c = st.curve;
-        if (!c) throw new TradeError("This isn't a pump.fun coin.", { kind: 'unsupported' });
-        if (c.complete) throw new TradeError('This coin already graduated. The bot only buys coins still on pump.fun.', { kind: 'unsupported' });
-        if (!pump.isSolPaired(c) || c.isCashbackCoin) throw new TradeError("This coin type can't be traded by the bot.", { kind: 'unsupported' });
-        if (opts.maxPrice && c.virtualTokenReserves > 0n) {
-          const now = Number(c.virtualQuoteReserves) / Number(c.virtualTokenReserves);
-          if (now > opts.maxPrice) throw new TradeError(opts.refPrice ? `the price is already up ${Math.round((now / opts.refPrice - 1) * 100)}% since they bought` : 'the price ran away', { kind: 'skipped' });
+        const ranAway = (now) => new TradeError(opts.refPrice ? `the price is already up ${Math.round((now / opts.refPrice - 1) * 100)}% since they bought` : 'the price ran away', { kind: 'skipped' });
+        let tokens, onPool = null;
+        if (!c || c.complete || opts.pool) {
+          // graduated: price it on its PumpSwap pool, like a real buy would
+          const pl = await this._readPool(mint, opts.pool || null);
+          if (!pl) throw new TradeError(c ? 'This coin is moving to PumpSwap right now. Try again in a moment.' : "This isn't a pump.fun coin.", { kind: c ? 'waiting' : 'unsupported' });
+          if (pl.ps.quoteMint !== pump.WSOL || pl.ps.isCashbackCoin) throw new TradeError("This coin type can't be traded by the bot.", { kind: 'unsupported' });
+          if (opts.maxPrice && pl.base > 0n) {
+            const now = Number(pl.quote) / Number(pl.base);
+            if (now > opts.maxPrice) throw ranAway(now);
+          }
+          tokens = (pump.poolBuyTokensOut(pl.base, pl.quote, lamports) * PRACTICE_SLIPPAGE) / 100n;
+          onPool = pl;
+        } else {
+          if (!pump.isSolPaired(c) || c.isCashbackCoin) throw new TradeError("This coin type can't be traded by the bot.", { kind: 'unsupported' });
+          if (opts.maxPrice && c.virtualTokenReserves > 0n) {
+            const now = Number(c.virtualQuoteReserves) / Number(c.virtualTokenReserves);
+            if (now > opts.maxPrice) throw ranAway(now);
+          }
+          tokens = (pump.curveBuyTokensOut(c, lamports) * PRACTICE_SLIPPAGE) / 100n;
         }
-        const tokens = (pump.curveBuyTokensOut(c, lamports) * PRACTICE_SLIPPAGE) / 100n;
         if (tokens <= 0n) throw new TradeError('Nothing left to buy on this coin.', { kind: 'unsupported' });
         const cost = lamports + PRACTICE_FEE;
         if (this.practice.balance < cost) throw new TradeError('Not enough practice SOL.', { kind: 'funds' });
         this.practice.balance -= cost;
         name = name || st.meta?.name; symbol = symbol || st.meta?.symbol;
-        pos = { tokens, costLamports: cost, tokenProgram: st.tokenProgram, via: 'practice', buySig: null, mayhem: !!c.isMayhemMode, creator: c.creator };
+        pos = onPool
+          ? { tokens, costLamports: cost, tokenProgram: st.tokenProgram, via: 'practice', buySig: null, mayhem: !!onPool.ps.isMayhemMode, creator: onPool.ps.coinCreator, onPool: true, complete: true, pool: onPool.addr }
+          : { tokens, costLamports: cost, tokenProgram: st.tokenProgram, via: 'practice', buySig: null, mayhem: !!c.isMayhemMode, creator: c.creator };
       } else {
-        const r = await this._queueTrade(() => this.trader.buy({ mint, lamports, slippagePct: rules.buySlippagePct, speed: rules.speed, maxPrice: opts.maxPrice || null, refPrice: opts.refPrice || null }), 'buy');
+        const r = await this._queueTrade(() => this.trader.buy({ mint, lamports, slippagePct: rules.buySlippagePct, speed: rules.speed, maxPrice: opts.maxPrice || null, refPrice: opts.refPrice || null, pool: opts.pool || null }), 'buy');
         let tokens = r.tokDelta;
         if (tokens === null) {
           // landed, but the exact amounts couldn't be read: use the wallet's balance
@@ -927,7 +948,7 @@ export class Bot extends EventTarget {
         // If that can't be read exactly, or looks wrong, use the amount spent.
         let cost = r.solDelta === null ? null : -r.solDelta - (r.rentDeposit || 0n);
         if (cost === null || cost < lamports / 2n || cost > lamports * 2n) cost = lamports + 100_000n;
-        pos = { tokens, costLamports: cost, rentDeposit: r.rentDeposit || 0n, tokenProgram: r.tokenProgram, via: r.via, buySig: r.sig };
+        pos = { tokens, costLamports: cost, rentDeposit: r.rentDeposit || 0n, tokenProgram: r.tokenProgram, via: r.via, buySig: r.sig, ...(r.via === 'PumpSwap' ? { onPool: true, complete: true, pool: r.pool } : {}) };
         this.failStreak = 0;
         this.refreshBalance().catch(() => {});
       }
@@ -947,7 +968,7 @@ export class Bot extends EventTarget {
         this.positions.set(id, p);
       }
       if (coin) coin.status = 'Bought';
-      try { const st = await this._readCoin(mint); await this._valuePosition(p, st.curve, this.now()); } catch { /* valued on the next check */ }
+      try { const held = this.positions.get(id) || p; await this._valuePosition(held, held.onPool ? null : (await this._readCoin(mint)).curve, this.now()); } catch { /* valued on the next check */ }
       const why = source === 'copy' ? ` (copying ${this.walletLabel(extra.copiedFrom)})` : extra.score !== undefined && extra.score !== null ? ` (score ${extra.score})` : '';
       this.log('buy', `Bought ${p.symbol} for ${sol} SOL${why}${mode === 'practice' ? ' (practice)' : ''}.`, { mint, sig: p.buySig });
       this._save();
@@ -1007,7 +1028,7 @@ export class Bot extends EventTarget {
     if (p.valuedAt && now - p.valuedAt > 20_000 && !p.complete) return; // stale price: don't act on it
     const tape = this.tapes.get(p.mint);
     const flow = tape ? flowSignals(tape, now, { since: p.openedAt }) : null;
-    const d = evaluateExit(p, p.lastValueLamports, this.rules(), { progress: p.progress ?? 0, complete: !!p.complete, flow, solUsd: this.solUsd }, now);
+    const d = evaluateExit(p, p.lastValueLamports, this.rules(), { progress: p.onPool ? 0 : p.progress ?? 0, complete: !!p.complete && !p.onPool, flow, solUsd: this.solUsd }, now);
     if (d.sell) this._sell(p, d.reason);
   }
 
@@ -1068,7 +1089,7 @@ export class Bot extends EventTarget {
       } else {
         // more room for the price only after the price actually moved away from us
         const slip = Math.min(60, rules.sellSlippagePct + (p.slipSteps || 0) * 15);
-        const r = await this._queueTrade(() => this.trader.sell({ mint: p.mint, tokenProgram: p.tokenProgram, amount: null, slippagePct: slip, speed: rules.speed }), 'sell');
+        const r = await this._queueTrade(() => this.trader.sell({ mint: p.mint, tokenProgram: p.tokenProgram, amount: null, slippagePct: slip, speed: rules.speed, pool: p.pool || null }), 'sell');
         proceeds = r.solDelta;
         sig = r.sig;
         via = r.via;
@@ -1155,7 +1176,7 @@ export class Bot extends EventTarget {
         if (proceeds < 0n) proceeds = 0n;
         this.practice.balance += proceeds;
       } else {
-        const r = await this._queueTrade(() => this.trader.sell({ mint: p.mint, tokenProgram: p.tokenProgram, amount, slippagePct: rules.sellSlippagePct, speed: rules.speed }), 'sell');
+        const r = await this._queueTrade(() => this.trader.sell({ mint: p.mint, tokenProgram: p.tokenProgram, amount, slippagePct: rules.sellSlippagePct, speed: rules.speed, pool: p.pool || null }), 'sell');
         proceeds = r.solDelta;
         sig = r.sig;
         via = r.via;
@@ -1419,7 +1440,7 @@ export class Bot extends EventTarget {
   }
 
   _walletTrades(w, sig, { trades = [], amm = [] }, at, { copyBuys, copySells }) {
-    for (const ev of amm) this._walletAmmTrade(w, sig, ev, at, { copySells });
+    for (const ev of amm) this._walletAmmTrade(w, sig, ev, at, { copyBuys, copySells });
     for (const ev of trades) {
       const before = BigInt(w.holdings[ev.mint] || 0n);
       w.holdings[ev.mint] = ev.isBuy ? before + ev.tokenAmount : before > ev.tokenAmount ? before - ev.tokenAmount : 0n;
@@ -1435,37 +1456,53 @@ export class Bot extends EventTarget {
   }
 
   /** A tracked wallet traded a graduated coin on PumpSwap. */
-  _walletAmmTrade(w, sig, ev, at, { copySells }) {
-    const entry = { sig, mint: null, pool: ev.pool, buy: ev.isBuy, sol: Number(ev.solAmount) / 1e9, t: at, symbol: null, name: null, note: ev.isBuy ? 'On PumpSwap: not copied (the bot buys pump.fun coins only)' : null };
+  _walletAmmTrade(w, sig, ev, at, { copyBuys, copySells }) {
+    const entry = { sig, mint: null, pool: ev.pool, buy: ev.isBuy, sol: Number(ev.solAmount) / 1e9, t: at, symbol: null, name: null, note: null };
     w.trades.unshift(entry);
     if (w.trades.length > 40) w.trades.length = 40;
     w.lastTradeAt = Math.max(w.lastTradeAt || 0, at);
-    this._poolMint(ev.pool).then((mint) => {
-      if (!mint) return;
+    const work = this._poolMint(ev.pool).then((mint) => {
+      if (!mint) {
+        if (ev.isBuy && copyBuys && w.copy) entry.note = "Not copied: this pool isn't a SOL pool";
+        this._emit();
+        return;
+      }
       entry.mint = mint;
       const meta = this._meta(mint);
       if (meta) { entry.symbol = meta.symbol; entry.name = meta.name; }
+      const before = BigInt(w.holdings[mint] || 0n);
+      w.holdings[mint] = ev.isBuy ? before + ev.baseAmount : before > ev.baseAmount ? before - ev.baseAmount : 0n;
+      if (!ev.isBuy && w.holdings[mint] === 0n) delete w.holdings[mint];
+      if (ev.isBuy && copyBuys && w.copy && ev.baseAmount > 0n) {
+        // their average price (fees included) is the reference for "don't chase"
+        const price = Number(ev.solAmount) / Number(ev.baseAmount);
+        return this._copyBuy(w, { mint, solAmount: ev.solAmount, solPaired: true, price, pool: ev.pool }, entry);
+      }
       if (!ev.isBuy && copySells) {
-        const fraction = ev.userBaseBefore > 0n ? Number(ev.baseAmount) / Number(ev.userBaseBefore) : 1;
+        const theirBefore = ev.userBaseBefore > 0n ? ev.userBaseBefore : before;
+        const fraction = theirBefore > 0n ? Number(ev.baseAmount) / Number(theirBefore) : 1;
         if (this._followSell(w, mint, fraction)) entry.note = 'Copied the sell';
       }
       this._emit();
     }).catch(() => {});
+    (this.pendingCopies ||= new Set()).add(work);
+    work.finally(() => this.pendingCopies.delete(work));
   }
 
-  /** Which coin a PumpSwap pool trades (cached; every pump.fun pool is the coin's canonical pool). */
+  /** Which coin a SOL PumpSwap pool trades (cached). null for pools not paired with SOL. */
   async _poolMint(pool) {
     this.poolMints ||= new Map();
     if (this.poolMints.has(pool)) return this.poolMints.get(pool);
     for (const p of this.positions.values()) {
-      if (await pump.canonicalPoolAddress(p.mint) === pool) { this.poolMints.set(pool, p.mint); return p.mint; }
+      if (p.pool === pool || await pump.canonicalPoolAddress(p.mint) === pool) { this.poolMints.set(pool, p.mint); return p.mint; }
     }
     if (!this.rpc) return null;
     const r = await this.rpc.call('getMultipleAccounts', [[pool], { encoding: 'base64', commitment: 'confirmed' }]);
     const a = r?.value?.[0];
     const ps = a && a.owner === pump.PUMP_AMM ? pump.decodePool(fromBase64(a.data[0])) : null;
-    const mint = ps ? ps.baseMint : null;
-    if (mint) this.poolMints.set(pool, mint);
+    if (!ps) return null;
+    const mint = ps.quoteMint === pump.WSOL && ps.baseMint !== pump.WSOL ? ps.baseMint : null;
+    this.poolMints.set(pool, mint);
     return mint;
   }
 
@@ -1504,11 +1541,11 @@ export class Bot extends EventTarget {
     const need = pump.solToLamports(w.copySol + (mode === 'real' ? rules.keepSolReserve + FEE_BUFFER_SOL : 0.001));
     if (this.availableLamports(mode) < need) return skip('not enough SOL');
     // don't chase: skip if the price ran more than 25% past what they paid (checked inside the buy, no extra wait)
-    const theirs = Number(ev.virtualSolReserves) / Number(ev.virtualTokenReserves);
+    const theirs = ev.price ?? Number(ev.virtualSolReserves) / Number(ev.virtualTokenReserves);
     entry.note = 'Copying…';
     this._emit();
     try {
-      const p = await this._buy(ev.mint, w.copySol, 'copy', { copiedFrom: w.address, creator: ev.creator || null }, { maxPrice: theirs > 0 ? theirs * 1.25 : null, refPrice: theirs > 0 ? theirs : null });
+      const p = await this._buy(ev.mint, w.copySol, 'copy', { copiedFrom: w.address, ...(ev.creator ? { creator: ev.creator } : {}) }, { maxPrice: theirs > 0 ? theirs * 1.25 : null, refPrice: theirs > 0 ? theirs : null, pool: ev.pool || null });
       entry.note = 'Copied';
       // they already sold everything while our buy was landing: don't get left holding it
       if (p && !(BigInt(w.holdings[ev.mint] || 0n) > 0n) && this.positions.get(p.id) === p) {
