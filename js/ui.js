@@ -142,6 +142,23 @@ export class UI {
     this.renderAll();
   }
 
+  /** Dollars when the SOL price is known, SOL otherwise. */
+  money(sol, { sign = false } = {}) {
+    const price = this.bot.solUsd;
+    if (price > 0) {
+      const usd = sol * price;
+      const body = '$' + Math.abs(usd).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      if (sign) return (usd >= 0.005 ? '+' : usd <= -0.005 ? '−' : '') + body;
+      return (usd <= -0.005 ? '−' : '') + body;
+    }
+    return (sign ? signed(sol) : solNum(sol)) + ' SOL';
+  }
+
+  offerUpdate(version, go) {
+    this.updateOffer = { version, go };
+    this.scheduleUpdate();
+  }
+
   scheduleUpdate() {
     if (this.updateQueued) return;
     this.updateQueued = true;
@@ -196,8 +213,9 @@ export class UI {
     const bal = toSol(b.availableLamports(mode));
     const st = b.stats(mode);
     const today = toSol(st.todayLamports);
+    const total = toSol(st.totalLamports);
     const openPos = [...b.positions.values()];
-    const usd = b.solUsd ? '$' + (bal * b.solUsd).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '';
+    const openPnl = toSol(b.openPnl(mode));
     const alerts = [...b.alerts.values()];
     const statusText = this.powerStatus();
     const feedLive = b.feed?.isLive();
@@ -212,10 +230,12 @@ export class UI {
       ${this.homeBanners()}
       <div class="card balance">
         <div class="spread"><span class="label">${real ? 'Bot wallet' : 'Practice balance'}</span>${real ? `<button class="btn small" data-action="deposit">Add SOL</button>` : `<button class="btn small" data-action="practice-sheet">Add money</button>`}</div>
-        <div class="amount money">${solNum(bal)} <small>SOL</small></div>
-        <div class="usd">${usd}${real && b.balance === null ? 'Checking balance…' : ''}</div>
+        <div class="amount money">${b.solUsd ? this.money(bal) : `${solNum(bal)} <small>SOL</small>`}</div>
+        <div class="usd">${real && b.balance === null ? 'Checking balance…' : b.solUsd ? solNum(bal) + ' SOL' : 'Loading the SOL price…'}</div>
         <div class="today">
-          <span class="chip ${cls(today)}"><span class="num">${signed(today)} SOL</span> today</span>
+          <span class="chip ${cls(today)}"><span class="num">Today ${this.money(today, { sign: true })}</span></span>
+          <span class="chip ${cls(total)}"><span class="num">All time ${this.money(total, { sign: true })}</span></span>
+          ${openPos.length ? `<span class="chip ${cls(openPnl)}"><span class="num">Open now ${this.money(openPnl, { sign: true })}</span></span>` : ''}
           <span class="chip">${st.trades} trades · ${st.wins} wins</span>
         </div>
       </div>
@@ -235,7 +255,7 @@ export class UI {
       </div>
       ${alerts.map((a) => `<div class="alert ${esc(a.level)}"><span class="ico">${a.level === 'error' ? '⚠️' : a.level === 'warn' ? '⏸' : 'ℹ️'}</span><div class="grow">${esc(a.message)}</div></div>`).join('')}
       ${needAwake ? `<div class="alert"><span class="ico">📱</span><div class="grow"><strong>Keep Win Bot open on screen.</strong> iPhone pauses apps in the background, so the bot only trades while it's open. Plug your phone in; the screen stays on by itself.</div></div>` : ''}
-      ${openPos.length ? `<div class="section-title">Open trades</div><div class="list">${openPos.map((p) => this.posRow(p)).join('')}</div>` : ''}
+      ${openPos.length ? `<div class="section-title spread"><span>Open trades</span>${openPos.length > 1 ? '<button class="btn ghost small" data-action="sell-all" style="min-height:24px;padding:0;color:var(--red)">Sell all</button>' : ''}</div><div class="list">${openPos.map((p) => this.posRow(p)).join('')}</div>` : ''}
       <div class="section-title spread"><span>Activity</span>${b.activity.length > 4 ? '<button class="btn ghost small" data-action="activity" style="min-height:24px;padding:0">See all</button>' : ''}</div>
       ${this.activityList(4)}
       <p class="small muted center mt2">Memecoins are extremely risky and most go to zero. Only use SOL you can afford to lose. Not financial advice.</p>
@@ -244,6 +264,7 @@ export class UI {
 
   homeBanners() {
     const out = [];
+    if (this.updateOffer) out.push(`<div class="alert ok"><span class="ico">✨</span><div class="grow"><strong>A new version of Win Bot is ready.</strong> It takes a few seconds; open trades are kept.<div class="row mt"><button class="btn small go" data-action="do-update">Update now</button></div></div></div>`);
     if (!this.store.ok) out.push(`<div class="alert error"><span class="ico">⚠️</span><div class="grow">This browser isn't saving data (Private Browsing?). Open Win Bot in normal Safari or from your Home Screen.</div></div>`);
     const funded = (this.bot.balance ?? 0n) > 0n || [...this.bot.positions.values()].some((p) => p.mode === 'real');
     if (isIos() && !isStandalone() && (funded || !this.a2hsDismissed)) {
@@ -306,9 +327,10 @@ export class UI {
     const pnl = value !== null ? value - cost : null;
     const pp = value !== null && cost > 0 ? (pnl / cost) * 100 : null;
     const state = p.state === 'selling' ? 'Selling…' : p.found ? 'In wallet' : p.lastError && p.sellAttempts ? 'Retrying sale' : 'Held ' + ago(p.openedAt);
-    return `<button class="item" data-action="pos" data-id="${esc(p.id)}">${avatar(p.symbol, p.mint)}
+    return `<div class="item posrow"><button class="tap-area" data-action="pos" data-id="${esc(p.id)}">${avatar(p.symbol, p.mint)}
       <div class="grow"><div style="font-weight:650">${esc(p.symbol)} <span class="badge ${p.mode}">${p.mode === 'real' ? 'REAL' : 'PRACTICE'}</span>${p.copiedFrom ? ' <span class="badge copy">COPY</span>' : ''}${p.mayhem ? ' <span class="badge mayhem">MAYHEM</span>' : ''}</div><div class="small muted">${esc(state)}</div></div>
-      <div class="val"><div class="${cls(pnl ?? 0)}" style="font-weight:700;font-size:17px">${pp !== null ? pct(pp) : '…'}</div><div class="small">${value !== null ? solNum(value) + ' SOL' : ''}</div></div></button>`;
+      <div class="val"><div class="${cls(pnl ?? 0)}" style="font-weight:700;font-size:17px">${pnl !== null ? this.money(pnl, { sign: true }) : '…'}</div><div class="small ${cls(pnl ?? 0)}">${pp !== null ? pct(pp) : ''}</div></div></button>
+      <button class="btn small danger sellbtn" data-action="sell" data-id="${esc(p.id)}" ${p.state === 'selling' ? 'disabled' : ''}>${p.state === 'selling' ? '…' : 'Sell'}</button></div>`;
   }
 
   activityList(n) {
@@ -424,7 +446,7 @@ export class UI {
           <span class="switch"><input type="checkbox" data-wallet-copy="${esc(w.address)}" ${w.copy ? 'checked' : ''}><span></span></span></label>
         ${w.copy ? `<div class="row"><span class="small" style="flex:1">SOL per copied trade</span><div class="stepper"><input data-wallet-sol="${esc(w.address)}" inputmode="decimal" value="${esc(w.copySol)}" aria-label="SOL per copied trade"><span class="small muted">SOL</span></div></div>` : ''}
       </div>
-      <div class="wtrades">${trades.length ? trades.map((t) => `<button class="wtrade" style="background:none;border:0;text-align:left;width:100%" data-action="coin" data-mint="${esc(t.mint)}"><span class="side ${t.buy ? 'b' : 's'}">${t.buy ? 'BUY' : 'SELL'}</span><div><div>${esc(t.symbol || short(t.mint))} · ${solNum(t.sol)} SOL</div>${t.note ? `<div class="note ${/^Copied|^Copying/.test(t.note) ? 'gold' : ''}">${esc(t.note)}</div>` : ''}</div><time>${ago(t.t, now)}</time></button>`).join('')
+      <div class="wtrades">${trades.length ? trades.map((t) => `<button class="wtrade" style="background:none;border:0;text-align:left;width:100%" data-action="coin" data-mint="${esc(t.mint)}"><span class="side ${t.buy ? 'b' : 's'}">${t.buy ? 'BUY' : 'SELL'}</span><div><div>${esc(t.symbol || short(t.mint))} · ${this.bot.solUsd ? this.money(t.sol) : solNum(t.sol) + ' SOL'}</div>${t.note ? `<div class="note ${/^Copied|^Copying/.test(t.note) ? 'gold' : ''}">${esc(t.note)}</div>` : ''}</div><time>${ago(t.t, now)}</time></button>`).join('')
         : `<p class="small muted" style="margin:6px 2px">${w.loading ? 'Loading their recent trades…' : 'No pump.fun trades seen yet. New ones show up here live.'}</p>`}</div>
       <div class="row mt"><a class="btn small" style="flex:1" href="https://pump.fun/profile/${esc(w.address)}" target="_blank" rel="noopener">pump.fun profile</a><button class="btn small danger" style="flex:1" data-action="wallet-remove" data-address="${esc(w.address)}">Remove</button></div>
     </div>`;
@@ -440,13 +462,14 @@ export class UI {
     const mode = b.settings.mode;
     let body;
     if (this.tradesView === 'open') {
-      body = open.length ? open.map((p) => this.posCard(p)).join('') + (open.length > 1 ? `<button class="btn danger mt" data-action="sell-all">Sell everything now</button>` : '')
+      const openPnl = toSol(b.openPnl(mode));
+      body = open.length ? (`<div class="card tight spread" style="margin-bottom:10px"><span class="muted">Up or down right now</span><b class="${cls(openPnl)}" style="font-size:19px">${this.money(openPnl, { sign: true })}</b></div>`) + open.map((p) => this.posCard(p)).join('') + (open.length > 1 ? `<button class="btn danger mt" data-action="sell-all">Sell everything now</button>` : '')
         : `<div class="list"><div class="empty"><b>No open trades</b>${b.running ? 'The bot buys when a coin passes its rules.' : 'Start the bot on Home, or buy a coin from the Coins tab.'}</div></div>`;
     } else {
       const st = b.stats(mode);
       const rate = st.trades ? Math.round((st.wins / st.trades) * 100) + '%' : '–';
       const hist = b.history.filter((h) => h.mode === mode).slice(0, 100);
-      body = `<div class="stats"><div class="stat"><b class="${cls(toSol(st.totalLamports))}">${signed(toSol(st.totalLamports))}</b><span>Total SOL</span></div><div class="stat"><b>${rate}</b><span>Win rate</span></div><div class="stat"><b>${st.trades}</b><span>Trades</span></div></div>
+      body = `<div class="stats"><div class="stat"><b class="${cls(toSol(st.totalLamports))}">${this.money(toSol(st.totalLamports), { sign: true })}</b><span>Total ${this.bot.solUsd ? '' : 'SOL'}</span></div><div class="stat"><b>${rate}</b><span>Win rate</span></div><div class="stat"><b>${st.trades}</b><span>Trades</span></div></div>
         <div class="section-title">${mode === 'real' ? 'Real' : 'Practice'} trades</div>
         ${hist.length ? `<div class="list">${hist.map((h) => this.histRow(h)).join('')}</div>` : `<div class="list"><div class="empty"><b>No finished trades yet</b>Sold trades show here with their result.</div></div>`}`;
     }
@@ -471,11 +494,17 @@ export class UI {
     else state = `Sells at ${pct(rules.takeProfitPct)} or ${pct(-rules.stopLossPct)}, when sellers take over, or after ${rules.maxHoldMin} min.`;
     return `<div class="card pos">
       <div class="top">${avatar(p.symbol, p.mint)}<div class="grow" style="flex:1"><div style="font-weight:700">${esc(p.name)}</div><div class="small muted">${esc(p.symbol)} · <span class="badge ${p.mode}">${p.mode === 'real' ? 'REAL' : 'PRACTICE'}</span>${p.copiedFrom ? ' <span class="badge copy">COPY</span>' : ''}${p.mayhem ? ' <span class="badge mayhem">MAYHEM</span>' : ''}${p.score !== null && p.score !== undefined ? ` <span class="badge gold">SCORE ${esc(p.score)}</span>` : ''}</div></div>
-      <div class="pnl ${cls(pnl ?? 0)}">${pp !== null ? pct(pp) : '…'}<small>${pnl !== null ? signed(pnl) + ' SOL' : 'pricing…'}</small></div></div>
-      <div class="facts"><div class="fact"><b>${solNum(cost)}</b><span>Paid (SOL)</span></div><div class="fact"><b>${value !== null ? solNum(value) : '–'}</b><span>Worth now</span></div><div class="fact"><b>${p.complete ? 'Graduated' : Math.round((p.progress || 0) * 100) + '%'}</b><span>Curve</span></div></div>
+      <div class="pnl ${cls(pnl ?? 0)}">${pnl !== null ? this.money(pnl, { sign: true }) : '…'}<small>${pp !== null ? pct(pp) + ' · ' + signed(pnl) + ' SOL' : 'pricing…'}</small></div></div>
+      <div class="facts"><div class="fact"><b>${this.money(cost)}</b><span>Paid</span></div><div class="fact"><b>${value !== null ? this.money(value) : '–'}</b><span>Worth now</span></div><div class="fact"><b>${p.complete ? 'Graduated' : Math.round((p.progress || 0) * 100) + '%'}</b><span>Curve</span></div></div>
       <div class="state">${state}</div>
-      <div class="actions"><button class="btn danger small" style="flex:1" data-action="sell" data-id="${esc(p.id)}" ${p.state === 'selling' ? 'disabled' : ''}>Sell now</button>
-      <a class="btn small" style="flex:1" href="https://pump.fun/coin/${esc(p.mint)}" target="_blank" rel="noopener">Chart</a></div></div>`;
+      ${this.sellButtons(p)}
+      <div class="actions"><a class="btn small" style="flex:1" href="https://pump.fun/coin/${esc(p.mint)}" target="_blank" rel="noopener">Chart</a>${p.buySig ? `<a class="btn small" style="flex:1" href="https://solscan.io/tx/${esc(p.buySig)}" target="_blank" rel="noopener">Solscan</a>` : ''}</div></div>`;
+  }
+
+  sellButtons(p) {
+    const off = p.state === 'selling' ? 'disabled' : '';
+    if (p.state === 'selling') return `<div class="sellrow"><button class="btn danger small" disabled>Selling…</button></div>`;
+    return `<div class="sellrow"><button class="btn danger small" data-action="sell-part" data-id="${esc(p.id)}" data-fraction="0.25" ${off}>Sell 25%</button><button class="btn danger small" data-action="sell-part" data-id="${esc(p.id)}" data-fraction="0.5" ${off}>Sell 50%</button><button class="btn danger small strong" data-action="sell" data-id="${esc(p.id)}" ${off}>Sell all</button></div>`;
   }
 
   histRow(h) {
@@ -484,7 +513,7 @@ export class UI {
     const pp = pnl !== null && cost > 0 ? (pnl / cost) * 100 : null;
     return `<button class="item" data-action="hist" data-id="${esc(h.id)}">${avatar(h.symbol, h.mint)}
       <div class="grow"><div style="font-weight:650">${esc(h.symbol)}${h.partial ? ' <span class="badge">PART</span>' : ''}${h.copiedFrom ? ' <span class="badge copy">COPY</span>' : ''}</div><div class="small muted">${esc(h.reason)} · ${agoText(h.closedAt)}</div></div>
-      <div class="val"><div class="${cls(pnl ?? 0)}" style="font-weight:700">${pp !== null ? pct(pp) : '?'}</div><div class="small">${pnl !== null ? signed(pnl) + ' SOL' : 'unknown'}</div></div></button>`;
+      <div class="val"><div class="${cls(pnl ?? 0)}" style="font-weight:700">${pnl !== null ? this.money(pnl, { sign: true }) : '?'}</div><div class="small ${cls(pnl ?? 0)}">${pp !== null ? pct(pp) : 'unknown'}</div></div></button>`;
   }
 
   // ---------- Settings ----------
@@ -682,6 +711,7 @@ export class UI {
           ${!c?.verdict ? `<dt>Bot's view</dt><dd>${esc(data.error || c?.status || (c?.scan ? c.scan.reason : data.complete ? 'Graduated coins can be sold here, not bought' : 'Not studied'))}</dd>` : ''}
           ${holders ? `<dt>Holders</dt><dd class="${holders.ok ? 'up' : 'down'}">${esc(holders.reason)}</dd>` : ''}
         </dl>
+        ${(() => { const hp = b.positions.get(mode + ':' + data.mint); if (!hp) return ''; const v = hp.lastValueLamports !== undefined ? toSol(hp.lastValueLamports) : null; const pl = v !== null ? v - toSol(hp.costLamports) : null; return `<div class="section-title">You hold this coin</div><div class="card tight"><div class="spread"><span class="muted">Up or down</span><b class="${cls(pl ?? 0)}">${pl !== null ? this.money(pl, { sign: true }) : '…'}</b></div>${this.sellButtons(hp)}</div>`; })()}
         ${c?.verdict ? this.studyReport(c) : ''}
         <div class="section-title">Buy with ${mode === 'real' ? 'real SOL' : 'practice SOL'}</div>
         <div class="btn-row ${amounts.length === 3 ? 'three' : ''}" style="grid-template-columns:repeat(${amounts.length},1fr)">${amounts.map((a) => `<button class="btn mode" data-action="buy" data-mint="${esc(data.mint)}" data-sol="${a}" ${this.busyBuys.has(data.mint) || b.buying.has(data.mint) ? 'disabled' : ''}>${this.busyBuys.has(data.mint) || b.buying.has(data.mint) ? '…' : a}</button>`).join('')}</div>
@@ -695,8 +725,8 @@ export class UI {
       const h = b.history.find((x) => x.id === data.id);
       if (!h) { this.closeSheet(); return; }
       html = `<div class="row">${avatar(h.symbol, h.mint)}<div><h2>${esc(h.name)}</h2><div class="muted">${esc(h.symbol)}</div></div></div>
-        <dl class="kv mt"><dt>Result</dt><dd class="${cls(h.pnlLamports === null ? 0 : toSol(h.pnlLamports))}">${h.pnlLamports === null ? 'Unknown' : signed(toSol(h.pnlLamports)) + ' SOL'}</dd>
-        <dt>Paid</dt><dd>${solNum(toSol(h.costLamports))} SOL</dd><dt>Got back</dt><dd>${h.proceedsLamports === null ? '–' : solNum(toSol(h.proceedsLamports)) + ' SOL'}</dd>
+        <dl class="kv mt"><dt>Result</dt><dd class="${cls(h.pnlLamports === null ? 0 : toSol(h.pnlLamports))}">${h.pnlLamports === null ? 'Unknown' : this.money(toSol(h.pnlLamports), { sign: true }) + (this.bot.solUsd ? ` (${signed(toSol(h.pnlLamports))} SOL)` : '')}</dd>
+        <dt>Paid</dt><dd>${this.money(toSol(h.costLamports))}</dd><dt>Got back</dt><dd>${h.proceedsLamports === null ? '–' : this.money(toSol(h.proceedsLamports))}</dd>
         <dt>Why it sold</dt><dd>${esc(h.reason)}</dd><dt>Held for</dt><dd>${ago(h.openedAt, h.closedAt)}</dd><dt>Mode</dt><dd>${h.mode === 'real' ? 'Real' : 'Practice'}</dd></dl>
         <div class="stack mt">${h.buySig ? `<a class="btn" href="https://solscan.io/tx/${esc(h.buySig)}" target="_blank" rel="noopener">Buy on Solscan</a>` : ''}${h.sellSig ? `<a class="btn" href="https://solscan.io/tx/${esc(h.sellSig)}" target="_blank" rel="noopener">Sell on Solscan</a>` : ''}</div>${close}`;
     } else if (kind === 'mode') {
@@ -887,6 +917,15 @@ export class UI {
         }
         case 'buy': await this.buy(t.dataset.mint, Number(t.dataset.sol)); break;
         case 'sell': await this.sell(t.dataset.id); break;
+        case 'sell-part': {
+          const p = b.positions.get(t.dataset.id);
+          const f = Number(t.dataset.fraction);
+          if (!p || !(f > 0)) break;
+          const ok = await this.confirm({ title: `Sell ${Math.round(f * 100)}% of ${p.symbol}?`, text: p.mode === 'real' ? 'Sells that part at the current price. The bot keeps managing the rest.' : 'Sells that part of your practice position at the current price.', ok: 'Sell', danger: true });
+          if (ok) { b.sellPart(t.dataset.id, f); this.toast(`Selling ${Math.round(f * 100)}% of ${p.symbol}…`); }
+          break;
+        }
+        case 'do-update': { const u = this.updateOffer; if (u) { t.disabled = true; t.textContent = 'Updating…'; await u.go(); } break; }
         case 'sell-all': {
           const ok = await this.confirm({ title: 'Sell everything now?', text: 'The bot sells every open trade at the current price.', ok: 'Sell all', danger: true });
           if (ok) b.sellAll();

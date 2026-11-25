@@ -2,7 +2,7 @@
 // and sells by its exit rules. Works the same in Practice (fake SOL, real
 // live prices) and Real mode. All state is saved on the phone.
 
-import { isAddress } from './b58.js';
+import { isAddress, b58encode } from './b58.js';
 import { Keypair } from './keys.js';
 import { associatedTokenAddress } from './pda.js';
 import * as pump from './pump.js';
@@ -19,6 +19,9 @@ const MAX_WATCH = 99;
 const MAX_STUDY = 8; // coins studied at the same time (each is a live trade subscription)
 const MAX_WALLETS = 10;
 const MAX_COPY_OPEN = 5;
+// Raydium's main SOL/USDC pool: the SOL price straight from the chain, through your own data key
+const RAYDIUM_SOL_USDC = '58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2';
+const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const COIN_TTL_MS = 20 * 60_000;
 const MAX_COINS = 400;
 const FEE_BUFFER_SOL = 0.006; // token account rent + network fees for one trade
@@ -110,6 +113,10 @@ export class Bot extends EventTarget {
     this.pending = st.pending || [];
     this.bought = new Set(st.bought || []);
     this.wasRunning = !!st.running;
+    // reopened by the app's own updater a moment ago: carry on where it left off
+    const resume = this.store.load('resumeAfterUpdate', null);
+    if (resume) this.store.save('resumeAfterUpdate', null);
+    this.resumeAfterUpdate = !!(resume && st.running && Date.now() - resume.at < 90_000);
     this.activity = st.activity || [];
     this.lossStreak = st.lossStreak || { practice: 0, real: 0 };
     this.wallets = (this.store.load('wallets', []) || []).filter((w) => w && isAddress(w.address)).map(normalizeWallet);
@@ -118,8 +125,10 @@ export class Bot extends EventTarget {
       this.refreshBalance().catch(() => {});
       this.reconcile().catch(() => {});
     }
+    const lastPrice = this.store.load('solUsd', null);
+    if (lastPrice && lastPrice.v > 0 && Date.now() - lastPrice.at < 24 * 3600_000) { this.solUsd = lastPrice.v; this._applyPendingPractice(); }
     this.refreshSolPrice();
-    this.priceTimer = setInterval(() => this.refreshSolPrice(), 5 * 60_000);
+    this.priceTimer = setInterval(() => this.refreshSolPrice(), 2 * 60_000);
     this._syncWatches();
     if (this.rpc) for (const w of this.wallets) this.refreshWallet(w.address).catch(() => {});
     this._ensureLoop();
@@ -291,23 +300,50 @@ export class Bot extends EventTarget {
 
   async refreshSolPrice() {
     const f = this.fetchImpl || ((...a) => globalThis.fetch(...a));
+    const getJson = async (url) => {
+      const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timer = setTimeout(() => ctrl?.abort(), 6000);
+      try { const r = await f(url, { signal: ctrl?.signal }); if (!r.ok) throw new Error('http ' + r.status); return await r.json(); }
+      finally { clearTimeout(timer); }
+    };
     const sources = [
-      ['https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', (j) => j?.solana?.usd],
-      ['https://api.coinbase.com/v2/prices/SOL-USD/spot', (j) => j?.data?.amount],
+      async () => (await getJson('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd'))?.solana?.usd,
+      () => this._onChainSolPrice(),
+      async () => (await getJson('https://api.coinbase.com/v2/prices/SOL-USD/spot'))?.data?.amount,
+      async () => { const j = await getJson('https://api.kraken.com/0/public/Ticker?pair=SOLUSD'); const k = j?.result && Object.keys(j.result)[0]; return k ? j.result[k]?.c?.[0] : null; },
+      async () => (await getJson('https://lite-api.jup.ag/price/v3?ids=' + pump.WSOL))?.[pump.WSOL]?.usdPrice,
     ];
-    for (const [url, pick] of sources) {
+    for (const src of sources) {
       try {
-        const r = await f(url);
-        const v = Number(pick(await r.json()));
-        if (v > 0 && v < 100000) {
+        const v = Number(await src());
+        if (v > 1 && v < 100000) {
           this.solUsd = v;
+          this.solUsdAt = Date.now();
+          this.store.save('solUsd', { v, at: this.solUsdAt });
           this._applyPendingPractice();
           this._emit();
           return v;
         }
-      } catch { /* try the next source; without a price the app shows SOL only */ }
+      } catch { /* try the next source */ }
     }
-    return null;
+    return null; // keep the last known price
+  }
+
+  /** SOL price from Raydium's SOL/USDC pool (checked: the vaults must hold SOL and USDC). */
+  async _onChainSolPrice() {
+    if (!this.rpc) return null;
+    if (!this.solPool) {
+      const r = await this.rpc.call('getMultipleAccounts', [[RAYDIUM_SOL_USDC], { encoding: 'base64', commitment: 'confirmed' }], { retries: 0 });
+      const a = r?.value?.[0];
+      if (!a) return null;
+      const d = fromBase64(a.data[0]);
+      if (d.length < 464 || b58encode(d.subarray(400, 432)) !== pump.WSOL || b58encode(d.subarray(432, 464)) !== USDC_MINT) return null;
+      this.solPool = { baseVault: b58encode(d.subarray(336, 368)), quoteVault: b58encode(d.subarray(368, 400)) };
+    }
+    const r = await this.rpc.call('getMultipleAccounts', [[this.solPool.baseVault, this.solPool.quoteVault], { encoding: 'base64', commitment: 'confirmed' }], { retries: 0 });
+    const [b, q] = (r?.value || []).map((x) => (x ? pump.decodeTokenAccount(fromBase64(x.data[0])) : null));
+    if (!b || !q || b.mint !== pump.WSOL || q.mint !== USDC_MINT || b.amount <= 0n) return null;
+    return (Number(q.amount) / 1e6) / (Number(b.amount) / 1e9);
   }
 
   /** Add pretend money to the practice balance, in dollars at the live SOL price. */
@@ -965,6 +1001,32 @@ export class Bot extends EventTarget {
     if (d.sell) this._sell(p, d.reason);
   }
 
+  /** Sell part of a position by hand (fraction 0..1). */
+  sellPart(id, fraction) {
+    const p = this.positions.get(id);
+    if (!p) return;
+    if (fraction >= 0.9) { this.sellNow(id); return; }
+    if (p.state === 'selling') throw new Error('This coin is already being sold. Try again in a moment.');
+    this._sellPart(p, fraction, `You sold ${Math.round(fraction * 100)}%`);
+  }
+
+  /** " (+$1.23)" for a profit or loss in lamports, when the SOL price is known. */
+  _usd(lamports) {
+    if (lamports === null || lamports === undefined || !(this.solUsd > 0)) return '';
+    const v = (Number(lamports) / 1e9) * this.solUsd;
+    return ` (${v >= 0 ? '+' : '−'}$${Math.abs(v).toFixed(2)})`;
+  }
+
+  /** Profit or loss right now on open trades (lamports), for the screen. */
+  openPnl(mode = this.settings.mode) {
+    let pnl = 0n;
+    for (const p of this._openPositions(mode)) {
+      if (p.lastValueLamports === undefined || p.found) continue;
+      pnl += BigInt(p.lastValueLamports) - BigInt(p.costLamports || 0n);
+    }
+    return pnl;
+  }
+
   sellNow(id) {
     const p = this.positions.get(id);
     if (!p) return;
@@ -1059,7 +1121,7 @@ export class Bot extends EventTarget {
     if (p.mode === 'real') this._clearAlert('fees');
     const pct = pnl !== null && cost > 0n ? (Number(pnl) / Number(cost)) * 100 : null;
     this.log(pnl !== null && pnl >= 0n ? 'win' : 'loss',
-      `Sold ${p.symbol}${pct !== null ? ` ${pct >= 0 ? '+' : ''}${pct.toFixed(0)}%` : ''} (${reason})${p.mode === 'practice' ? ' (practice)' : ''}.`, { mint: p.mint, sig });
+      `Sold ${p.symbol}${pct !== null ? ` ${pct >= 0 ? '+' : ''}${pct.toFixed(0)}%` : ''}${this._usd(pnl)} (${reason})${p.mode === 'practice' ? ' (practice)' : ''}.`, { mint: p.mint, sig });
     this._save();
     this._emit();
   }
@@ -1105,7 +1167,7 @@ export class Bot extends EventTarget {
         reason, buySig: p.buySig || null, sellSig: sig, via, found: false, partial: true, source: p.source || null, copiedFrom: p.copiedFrom || null,
       });
       const pct = pnl !== null && costPart > 0n ? (Number(pnl) / Number(costPart)) * 100 : null;
-      this.log(pnl !== null && pnl >= 0n ? 'win' : 'loss', `Sold ${Math.round(fraction * 100)}% of ${p.symbol}${pct !== null ? ` ${pct >= 0 ? '+' : ''}${pct.toFixed(0)}%` : ''} (${reason})${p.mode === 'practice' ? ' (practice)' : ''}.`, { mint: p.mint, sig });
+      this.log(pnl !== null && pnl >= 0n ? 'win' : 'loss', `Sold ${Math.round(fraction * 100)}% of ${p.symbol}${pct !== null ? ` ${pct >= 0 ? '+' : ''}${pct.toFixed(0)}%` : ''}${this._usd(pnl)} (${reason})${p.mode === 'practice' ? ' (practice)' : ''}.`, { mint: p.mint, sig });
     } catch (e) {
       this.log('error', `Couldn't sell part of ${p.symbol}: ${e.message}`, { mint: p.mint, sig: e.sig || null });
     } finally {

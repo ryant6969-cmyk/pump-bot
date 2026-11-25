@@ -91,6 +91,7 @@ async function main() {
     viewport: { width: 440, height: 956 }, deviceScaleFactor: 3, isMobile: true, hasTouch: true,
     userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.1 Mobile/15E148 Safari/604.1',
     colorScheme: 'light',
+    serviceWorkers: 'block',
   });
   await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: ORIGIN });
   const page = await context.newPage();
@@ -213,6 +214,11 @@ async function main() {
   log('waiting for the practice buy (after a 45 s study)…');
   await page.waitForFunction(() => document.querySelectorAll('[data-action="pos"]').length > 0, null, { timeout: 120_000 });
   await shot('12-home-practice-holding');
+  const homeText = await page.locator('.balance').textContent();
+  log('home shows dollars:', /\$\d/.test(homeText) && /Today [+−]?\$/.test(homeText) ? 'ok' : 'UNEXPECTED ' + homeText);
+  if (!/Today [+−]?\$/.test(homeText)) errors.push('home does not show profit in dollars');
+  const rowText = await page.locator('.posrow').first().textContent();
+  log('open trade row:', rowText.replace(/\s+/g, ' ').trim());
   await tap('[data-action="tab"][data-tab="trades"]');
   await shot('13-trades-open');
   log('waiting for take profit…');
@@ -294,7 +300,16 @@ async function main() {
   await tap('[data-action="tab"][data-tab="trades"]');
   await tap('[data-action="trades-view"][data-view="open"]');
   await shot('24-trades-real-open');
-  // sell by hand
+  // sell half by hand, then the rest
+  const tokensBefore = chain.tokenAmount(ata);
+  await tap('[data-action="sell-part"][data-fraction="0.5"]');
+  await tap('[data-dlg="yes"]');
+  await page.waitForFunction(() => document.querySelector('.pos') && !document.querySelector('.sellrow .btn[disabled]'), null, { timeout: 30_000 });
+  await sleep(500);
+  const tokensHalf = chain.tokenAmount(ata);
+  log('sold half by hand:', tokensHalf > 0n && tokensHalf * 100n < tokensBefore * 55n && tokensHalf * 100n > tokensBefore * 45n ? 'ok' : `UNEXPECTED ${tokensHalf} of ${tokensBefore}`);
+  if (!(tokensHalf * 100n < tokensBefore * 55n && tokensHalf * 100n > tokensBefore * 45n)) errors.push('partial sell did not sell half');
+  await shot('24b-trades-after-half');
   await tap('[data-action="sell"]');
   await tap('[data-dlg="yes"]');
   await page.waitForFunction(() => !document.querySelector('.pos'), null, { timeout: 30_000 });

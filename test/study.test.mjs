@@ -207,3 +207,57 @@ test('practice money: the one-time $500 is added once the SOL price loads, and o
   again.solUsd = null;
   assert.throws(() => again.addPracticeUsd(100), /SOL price/);
 });
+
+test('sell buttons: sell part of a trade by hand, then the rest', async () => {
+  const t = await setup({ mode: 'practice' });
+  await t.othersBuy(1);
+  const p = await t.bot.manualBuy(t.mint, 0.1);
+  const before = BigInt(p.tokens);
+  const bal = t.bot.practice.balance;
+  t.bot.sellPart(p.id, 0.25);
+  await until(() => p.state === 'open' && t.bot.history.length === 1);
+  assert.equal(BigInt(p.tokens), before - before / 4n, 'sold a quarter');
+  assert.ok(t.bot.practice.balance > bal, 'got practice SOL back');
+  assert.ok(t.bot.history[0].partial);
+  assert.equal(t.bot.history[0].reason, 'You sold 25%');
+  t.bot.sellPart(p.id, 1);
+  await until(() => t.bot.positions.size === 0);
+  assert.equal(t.bot.history[0].reason, 'Sold by you');
+  assert.equal(t.bot.stats('practice').trades, 1, 'one trade, partial sells included in its total');
+});
+
+test('dollars: the SOL price comes from the chain when price websites are blocked', async () => {
+  const { MockChain, encodeTokenAccount } = await import('./mockchain.mjs');
+  const { b58decode } = await import('../js/b58.js');
+  const chain = new MockChain();
+  const USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+  const baseVault = b58encode(nodeCrypto.randomBytes(32)), quoteVault = b58encode(nodeCrypto.randomBytes(32));
+  const pool = new Uint8Array(752);
+  pool.set(b58decode(baseVault), 336); pool.set(b58decode(quoteVault), 368);
+  pool.set(b58decode(pump.WSOL), 400); pool.set(b58decode(USDC), 432);
+  chain.set('58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2', { lamports: 1n, owner: '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', data: pool });
+  chain.set(baseVault, { lamports: 1n, owner: pump.TOKEN, data: encodeTokenAccount(pump.WSOL, 'GThUX1Atko4tqhN2NaiTazWSeFWMuiUvfFnyJyUghFMJ', 100_000n * 10n ** 9n) });
+  chain.set(quoteVault, { lamports: 1n, owner: pump.TOKEN, data: encodeTokenAccount(USDC, 'GThUX1Atko4tqhN2NaiTazWSeFWMuiUvfFnyJyUghFMJ', 14_250_000n * 10n ** 6n) });
+  const blocked = async (url, init) => { if (/coingecko|coinbase|kraken|jup\.ag/.test(String(url))) throw new TypeError('Load failed'); return chain.fetchImpl(url, init); };
+  const { MemStorage } = await import('./harness.mjs');
+  const bot = new Bot({ store: new Store(new MemStorage()), fetchImpl: blocked, WebSocketImpl: TestWS, timing: FAST });
+  bots.push(bot);
+  await bot.init();
+  bot.updateSettings({ rpcInput: 'https://rpc.test/' });
+  assert.equal(await bot.refreshSolPrice(), 142.5);
+  assert.equal(bot.solUsd, 142.5);
+  // a pool whose vaults aren't SOL and USDC is never trusted
+  chain.set(quoteVault, { lamports: 1n, owner: pump.TOKEN, data: encodeTokenAccount(b58encode(nodeCrypto.randomBytes(32)), 'GThUX1Atko4tqhN2NaiTazWSeFWMuiUvfFnyJyUghFMJ', 1n) });
+  bot.solUsd = null;
+  assert.equal(await bot.refreshSolPrice(), null);
+  assert.equal(bot._usd(-1_500_000_000n), '');
+  bot.solUsd = 142.5;
+  assert.equal(bot._usd(-1_500_000_000n), ' (−$213.75)');
+});
+
+test('the version the app reports matches version.json (what the updater compares)', async () => {
+  const fs = await import('node:fs');
+  const main = fs.readFileSync(new URL('../js/main.js', import.meta.url), 'utf8');
+  const v = JSON.parse(fs.readFileSync(new URL('../version.json', import.meta.url), 'utf8')).version;
+  assert.equal(main.match(/const VERSION = '([^']+)'/)[1], v);
+});
